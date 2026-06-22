@@ -1,0 +1,94 @@
+# Example: drive Codex CLI through this proxy against a generic
+# OpenAI-Chat-Completions-compatible API gateway.
+#
+# Build:
+#   cargo build --release
+#
+# Codex CLI setup — add to ~/.codex/config.toml:
+#   openai_base_url = "http://localhost:3000/v1"
+#   model = "gpt-5.5"
+#
+# Run (with $GATEWAY_BASE_URL and $GATEWAY_API_KEY exported):
+#   ./target/release/responses-proxy --config examples/codex-openai-gateway.yaml
+
+server:
+  listen: "0.0.0.0:3000"
+  timeout: 600
+  log-level: info
+
+  # AES-256-GCM key for compact summary encryption (32 bytes / 64 hex).
+  # Replace with a freshly generated key in real deployments.
+  compact-encryption-key: "0000000000000000000000000000000000000000000000000000000000000000"
+
+  auth:
+    keys: []
+
+  cors:
+    allow-origins: []
+
+  # The Responses->Chat converter only emits `function` and `custom` tools;
+  # other Responses-API tool types are dropped regardless of this list.
+  # `custom` (e.g. Codex apply_patch with a Lark grammar) is not part of
+  # Chat Completions and most gateways reject requests that include it —
+  # so for a Chat-Completions-only upstream, `function` is the only useful
+  # entry.
+  allowed-tool-types:
+    - function
+
+models:
+  gpt-5.5:
+    model: openai/gpt-5.5
+    rewrite: openai-gateway
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  codex-auto-review:
+    model: openai/gpt-5.5
+    rewrite: openai-gateway
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+# Reusable rewrite profile for a generic OpenAI-compatible gateway.
+# Most Chat Completions fields pass through unchanged; the rules below
+# only patch the small set of incompatibilities seen with Codex CLI.
+rewrites:
+  openai-gateway:
+    # Codex resends prior assistant turns in `input` with content blocks of
+    # type `output_text` (their on-the-wire shape). The proxy's
+    # InputContentBlock enum only accepts input_text/input_image/input_file/
+    # input_audio, so those blocks fall into the Unknown catch-all and the
+    # whole item is dropped from the converted Chat request, losing
+    # conversation history. Normalize to `input_text` before the typed parse.
+    - at: response-in
+      replace:
+        input.*.content.*.type:
+          - if: "^output_text$"
+            set: input_text
+
+    # Codex uses the "developer" role; the OpenAI Chat schema accepts
+    # "system"/"user"/"assistant"/"tool" — fold developer into system.
+    - at: chat-out
+      replace:
+        messages.*.role:
+          - if: "^developer$"
+            set: system
+
+    # Some gateways stream reasoning under `reasoning` (both in non-stream
+    # responses and SSE deltas) instead of OpenAI-standard `reasoning_content`.
+    # Rename so the proxy's Chat types pick it up and surface it as a
+    # Reasoning output item. `reasoning_details` is gateway-specific and not
+    # part of the Chat schema — drop it.
+    # Note: rename does not expand wildcards (only remove/replace/reset do),
+    # so choices[0] is hard-coded — Chat Completions only ever has one
+    # choice in this proxy's flow.
+    - at: chat-in
+      rename:
+        choices.0.message.reasoning: choices.0.message.reasoning_content
+        choices.0.delta.reasoning: choices.0.delta.reasoning_content
+      remove:
+        - choices.*.message.reasoning_details
+        - choices.*.delta.reasoning_details

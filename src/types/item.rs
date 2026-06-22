@@ -805,7 +805,10 @@ pub struct OutputMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Reasoning {
-    pub id: String,
+    // Optional: clients (e.g. Codex CLI) replay prior reasoning items
+    // without an `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(default)]
     pub summary: Vec<SummaryPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1069,6 +1072,42 @@ mod tests {
             },
             _ => panic!("expected FunctionCallOutput variant"),
         }
+    }
+
+    #[test]
+    fn input_item_reasoning_without_id_deserializes() {
+        let json = serde_json::json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "deadbeef",
+            "content": null,
+        });
+        let item: InputItem = serde_json::from_value(json).unwrap();
+        match &item {
+            InputItem::Reasoning(r) => {
+                assert!(r.id.is_none());
+                assert_eq!(r.encrypted_content.as_deref(), Some("deadbeef"));
+                assert!(r.summary.is_empty());
+            }
+            _ => panic!("expected Reasoning variant, got {item:?}"),
+        }
+    }
+
+    #[test]
+    fn input_item_reasoning_with_id_roundtrip() {
+        let json = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_abc",
+            "summary": [],
+        });
+        let item: InputItem = serde_json::from_value(json).unwrap();
+        match &item {
+            InputItem::Reasoning(r) => assert_eq!(r.id.as_deref(), Some("rs_abc")),
+            _ => panic!("expected Reasoning variant"),
+        }
+        let roundtripped = serde_json::to_value(&item).unwrap();
+        assert_eq!(roundtripped["type"], "reasoning");
+        assert_eq!(roundtripped["id"], "rs_abc");
     }
 
     #[test]

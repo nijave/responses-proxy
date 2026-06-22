@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(resp.output.len(), 2);
         // First output should be reasoning
         if let OutputItem::Reasoning(r) = &resp.output[0] {
-            assert_eq!(r.id, "rsn_1");
+            assert_eq!(r.id.as_deref(), Some("rsn_1"));
             assert_eq!(r.status.as_deref(), Some("completed"));
             assert!(r.content.is_some());
         } else {
