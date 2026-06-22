@@ -230,9 +230,6 @@ pub async fn responses_to_chat(
                         tool_call_id: ctco.call_id.clone(),
                     }));
                 }
-                // Trigger for remote compaction v2: handled before reaching the
-                // chat converter, so silently drop if it slips through here.
-                InputItem::CompactionTrigger(_) => {}
                 other => {
                     tracing::warn!(
                         item = ?other,
@@ -528,8 +525,6 @@ pub fn items_to_chat_messages(
                     tool_call_id: ctco.call_id.clone(),
                 }));
             }
-            // Trigger for remote compaction v2 — handled upstream of conversion.
-            InputItem::CompactionTrigger(_) => {}
             other => {
                 tracing::warn!(
                     item = ?other,

@@ -208,7 +208,7 @@ pub(crate) fn build_reasoning_item(
 ) -> item::Reasoning {
     if let Some(key) = compact_key {
         item::Reasoning {
-            id: Some(id),
+            id,
             summary: vec![],
             encrypted_content: crate::crypto::encrypt(key, text),
             content: None,
@@ -216,7 +216,7 @@ pub(crate) fn build_reasoning_item(
         }
     } else {
         item::Reasoning {
-            id: Some(id),
+            id,
             summary: vec![],
             encrypted_content: None,
             content: Some(vec![ReasoningTextPart {
@@ -759,7 +759,7 @@ fn emit_reasoning_delta(state: &mut StreamState, reasoning: &str, events: &mut V
         events.push(StreamEvent::OutputItemAdded(event::OutputItemAdded {
             output_index: idx,
             item: OutputItem::Reasoning(item::Reasoning {
-                id: Some(state.reasoning_id.clone()),
+                id: state.reasoning_id.clone(),
                 summary: vec![],
                 encrypted_content: None,
                 content: Some(vec![]),

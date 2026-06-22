@@ -54,17 +54,6 @@ pub async fn responses(
         })?;
     }
 
-    // Codex remote-compaction-v2 short-circuit: when `input` carries a
-    // `compaction_trigger`, run the summary turn through the shared compaction
-    // helper and return a single `compaction` output instead of a chat reply.
-    if req
-        .input
-        .iter()
-        .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
-    {
-        return handle_compaction_trigger(&state, &provider, req).await;
-    }
-
     let model = req.model.clone();
     let is_stream = req.stream;
     let provider_model = provider.model.clone();
@@ -531,134 +520,6 @@ async fn handle_streaming(
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
 }
 
-// ── Remote compaction v2 trigger ─────────────────────────────────────────
-
-/// Handle a `/v1/responses` request whose `input` contains a
-/// `compaction_trigger`. Builds the summary via the shared compaction helper
-/// and returns a single `compaction` output item as either JSON (non-stream)
-/// or a three-event SSE stream (`response.created` →
-/// `response.output_item.done` → `response.completed`).
-async fn handle_compaction_trigger(
-    state: &crate::app::State,
-    provider: &crate::config::ResolvedProvider,
-    req: ResponsesRequest,
-) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let (output, usage, created_at) = crate::handlers::compact::build_compaction_output(
-        state,
-        provider,
-        req.previous_response_id.as_deref(),
-    )
-    .await?;
-
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let mut resp = crate::types::responses::Response {
-        id: response_id.clone(),
-        model: req.model.clone(),
-        status: ResponseStatus::Completed,
-        created_at,
-        output,
-        usage: Some(usage),
-        ..Default::default()
-    };
-    if let Some(ref meta) = req.metadata {
-        resp.metadata = Some(meta.clone());
-    }
-    resp.previous_response_id = req.previous_response_id.clone();
-    resp.parallel_tool_calls = req.parallel_tool_calls;
-
-    // Persist so a follow-up `previous_response_id` lookup finds it. The
-    // stored chat history is empty — the next turn will replay the compaction
-    // output item, which already decrypts/replays as a system message.
-    if req.store {
-        state.store().put(response_id.clone(), vec![]).await;
-    }
-
-    if req.stream {
-        return stream_compaction_trigger(provider, resp).await;
-    }
-
-    if provider.rewrite.responses_out.is_empty() {
-        return Ok(Json(resp).into_response());
-    }
-
-    let mut body = serde_json::to_value(&resp).map_err(|e| {
-        let err = Error::server_error(e.to_string());
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-    })?;
-    crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.responses_out).map_err(|msg| {
-        let err = Error::server_error(msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-    })?;
-    Ok(Json(body).into_response())
-}
-
-async fn stream_compaction_trigger(
-    provider: &crate::config::ResolvedProvider,
-    resp: crate::types::responses::Response,
-) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    use crate::types::event::{Completed, Created, InProgress, OutputItemDone};
-    let responses_out = provider.rewrite.responses_out.clone();
-
-    // The compaction item lives at output_index 0 — there is only ever one in
-    // this response (Codex's collect_compaction_output asserts exactly one).
-    let item = resp.output.first().cloned().ok_or_else(|| {
-        let err = Error::server_error("compaction helper returned no output");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-    })?;
-    // Lifecycle payload mirrors the normal streaming flow: created/in_progress
-    // carry an empty output and `in_progress` status; completed carries the
-    // full response.
-    let lifecycle = crate::types::responses::Response {
-        status: ResponseStatus::InProgress,
-        output: vec![],
-        usage: None,
-        ..resp.clone()
-    };
-    let events = vec![
-        StreamEvent::Created(Created {
-            response: lifecycle.clone(),
-            sequence_number: 0,
-        }),
-        StreamEvent::InProgress(InProgress {
-            response: lifecycle,
-            sequence_number: 1,
-        }),
-        StreamEvent::OutputItemDone(OutputItemDone {
-            item,
-            output_index: 0,
-            sequence_number: 2,
-        }),
-        StreamEvent::Completed(Completed {
-            response: resp,
-            sequence_number: 3,
-        }),
-    ];
-
-    let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(8);
-    for event in events {
-        let prepared = crate::types::streaming::prepare_stream_event(event, &responses_out)
-            .map_err(|msg| {
-                let err = Error::server_error(msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-            })?;
-        let sse_event = SseEvent::default()
-            .event(prepared.event_type)
-            .json_data(prepared.body)
-            .map_err(|e| {
-                let err = Error::server_error(e.to_string());
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-            })?;
-        if tx.send(Ok(sse_event)).await.is_err() {
-            break;
-        }
-    }
-    drop(tx);
-
-    Ok(Sse::new(ReceiverStream::new(rx))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
 fn build_stream_lifecycle_response(
     response_id: &str,
     model: &str,
@@ -970,7 +831,7 @@ mod tests {
         assert_eq!(resp.output.len(), 2);
         // First output should be reasoning
         if let OutputItem::Reasoning(r) = &resp.output[0] {
-            assert_eq!(r.id.as_deref(), Some("rsn_1"));
+            assert_eq!(r.id, "rsn_1");
             assert_eq!(r.status.as_deref(), Some("completed"));
             assert!(r.content.is_some());
         } else {
@@ -1077,31 +938,5 @@ mod tests {
         assert_eq!(resp.id, "resp_empty");
         assert_eq!(resp.output.len(), 0);
         assert!(resp.usage.is_none());
-    }
-
-    // ── compaction_trigger detection ────────────────────────────────────────
-
-    #[test]
-    fn detects_compaction_trigger_in_input() {
-        use crate::types::item::{CompactionTrigger, InputItem};
-        let input = [InputItem::CompactionTrigger(CompactionTrigger::default())];
-        assert!(
-            input
-                .iter()
-                .any(|i| matches!(i, InputItem::CompactionTrigger(_)))
-        );
-    }
-
-    #[test]
-    fn plain_input_is_not_a_compaction_trigger() {
-        let json = serde_json::json!([
-            { "type": "message", "role": "user", "content": "hi" }
-        ]);
-        let input: Vec<crate::types::item::InputItem> = serde_json::from_value(json).unwrap();
-        assert!(
-            !input
-                .iter()
-                .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
-        );
     }
 }
