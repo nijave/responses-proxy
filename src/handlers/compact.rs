@@ -1,3 +1,4 @@
+use crate::config::ResolvedProvider;
 use crate::types::chat::{self, Completion, MessageRequest};
 use crate::types::item::{Compaction, OutputContentBlock, OutputItem, OutputMessage};
 use crate::types::responses::{self, CompactedResponse, Error, Request};
@@ -14,14 +15,37 @@ pub async fn compact(
     State(state): State<crate::app::State>,
     Json(req): Json<Request>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let provider = state.config().models.get(&req.model).ok_or_else(|| {
+        let err = Error::invalid_request(format!("Unknown model: {}", req.model));
+        (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
+    })?;
+
+    let (output, usage, created_at) =
+        build_compaction_output(&state, provider, req.previous_response_id.as_deref()).await?;
+
+    Ok(Json(CompactedResponse {
+        id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+        object: "response.compaction".into(),
+        created_at,
+        output,
+        usage,
+    }))
+}
+
+/// Run a summary turn against the configured provider and wrap the result in a
+/// `compaction` output item. Returns `(output, usage, created_at)` so callers
+/// can package the data into either a `CompactedResponse` (for the standalone
+/// `/v1/responses/compact` endpoint) or a normal `responses::Response` /
+/// SSE stream (for the in-band `compaction_trigger` flow on `/v1/responses`).
+pub(crate) async fn build_compaction_output(
+    state: &crate::app::State,
+    provider: &ResolvedProvider,
+    previous_response_id: Option<&str>,
+) -> Result<(Vec<OutputItem>, responses::Usage, i64), (StatusCode, Json<serde_json::Value>)> {
     // Walk the stored continuation chain so compaction sees the same replay
     // history that previous_response_id continuation would use.
-    let mut messages: Vec<MessageRequest> = match req.previous_response_id {
-        Some(ref pid) => state
-            .store()
-            .get(pid)
-            .await
-            .unwrap_or(Vec::with_capacity(req.input.len())),
+    let mut messages: Vec<MessageRequest> = match previous_response_id {
+        Some(pid) => state.store().get(pid).await.unwrap_or_default(),
         None => vec![],
     };
 
@@ -33,12 +57,6 @@ pub async fn compact(
         }]),
         name: None,
     }));
-
-    // Look up the model provider
-    let provider = state.config().models.get(&req.model).ok_or_else(|| {
-        let err = Error::invalid_request(format!("Unknown model: {}", req.model));
-        (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
-    })?;
 
     // Build upstream request (non-streaming, no tools, reasoning disabled)
     let upstream_req = chat::Request {
@@ -168,11 +186,5 @@ pub async fn compact(
         })]
     };
 
-    Ok(Json(CompactedResponse {
-        id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-        object: "response.compaction".into(),
-        created_at: chat_resp.created,
-        output,
-        usage,
-    }))
+    Ok((output, usage, chat_resp.created))
 }

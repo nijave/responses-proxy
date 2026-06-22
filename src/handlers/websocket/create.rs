@@ -81,6 +81,19 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         };
     }
 
+    // Codex remote-compaction-v2 short-circuit: when `input` carries a
+    // `compaction_trigger`, run the summary turn through the shared compaction
+    // helper and emit a single `compaction` output item instead of forwarding
+    // to the chat upstream.
+    if req
+        .input
+        .iter()
+        .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+    {
+        handle_compaction_trigger(state, &provider, socket, req).await;
+        return;
+    }
+
     let model = req.model.clone();
     let generate = req.generate;
 
@@ -401,6 +414,119 @@ async fn run_stream(
         }
     }
     (ss.to_response_message(), cancelled, collected_events)
+}
+
+/// Run the shared compaction helper and emit a four-event lifecycle on the
+/// WebSocket: `response.created` → `response.in_progress` →
+/// `response.output_item.done` (carrying the single `compaction` item) →
+/// `response.completed`. Mirrors the SSE flow in handlers::responses.
+async fn handle_compaction_trigger(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    socket: &mut WebSocket,
+    req: Request,
+) {
+    let (output, usage, created_at) = match crate::handlers::compact::build_compaction_output(
+        state,
+        provider,
+        req.previous_response_id.as_deref(),
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err((status, body)) => {
+            let message = body
+                .0
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("compaction failed")
+                .to_string();
+            let ws_err = websocket::ErrorEvent::new(
+                status.as_u16(),
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                message,
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+    };
+
+    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let mut resp = Response {
+        id: rid.clone(),
+        model: req.model.clone(),
+        status: ResponseStatus::Completed,
+        created_at,
+        output,
+        usage: Some(usage),
+        ..Default::default()
+    };
+    if let Some(ref meta) = req.metadata {
+        resp.metadata = Some(meta.clone());
+    }
+    resp.previous_response_id = req.previous_response_id.clone();
+    resp.parallel_tool_calls = req.parallel_tool_calls;
+
+    let item = match resp.output.first().cloned() {
+        Some(item) => item,
+        None => {
+            let ws_err = websocket::ErrorEvent::new(
+                500,
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                "compaction helper returned no output".into(),
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+    };
+
+    let lifecycle = Response {
+        status: ResponseStatus::InProgress,
+        output: vec![],
+        usage: None,
+        ..resp.clone()
+    };
+    let events = [
+        StreamEvent::Created(event::Created {
+            response: lifecycle.clone(),
+            sequence_number: 0,
+        }),
+        StreamEvent::InProgress(event::InProgress {
+            response: lifecycle,
+            sequence_number: 1,
+        }),
+        StreamEvent::OutputItemDone(event::OutputItemDone {
+            item,
+            output_index: 0,
+            sequence_number: 2,
+        }),
+        StreamEvent::Completed(event::Completed {
+            response: resp,
+            sequence_number: 3,
+        }),
+    ];
+    for event in events {
+        match prepare_stream_event(event, &provider.rewrite.responses_out) {
+            Ok(prepared) => super::send(socket, &prepared.body.to_string()).await,
+            Err(message) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    500,
+                    Error::TYPE_SERVER_ERROR,
+                    Error::CODE_SERVER_ERROR,
+                    message,
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        }
+    }
+
+    if req.store {
+        state.store().put(rid, vec![]).await;
+    }
 }
 
 #[cfg(test)]
