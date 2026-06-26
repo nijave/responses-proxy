@@ -219,6 +219,16 @@ rewrites:
 
 Set `"stream": true` in the Responses API request. The proxy converts Chat API SSE chunks into Responses API streaming events (`response.created` → `response.output_text.delta` → `response.completed`). Tool call deltas are accumulated across chunks and emitted in the final event.
 
+## History & Compaction
+
+Codex CLI runs with `store: false` and replays the **entire conversation history inline** in `input` on every turn — tool calls, tool outputs, reasoning, and compaction items included. The proxy expands that `input` into Chat API `messages` per request; it does not rely on server-side accumulation for Codex traffic.
+
+Because tool outputs dominate replayed history (~78% of bytes in real sessions), the proxy applies **age-based tool-output truncation** on the Responses → Chat path. Outputs from the last `KEEP_LAST_TURNS` (6) user turns are kept verbatim; older outputs larger than ~2 KB are reduced to `head + …[truncated N bytes]… + tail`, preserving the start and end of each output while cutting the bulk. Tool-call/tool-output pairing (`tool_call_id`) is never broken — only the textual content of old outputs shrinks. Truncation is UTF-8-boundary safe.
+
+Compaction is driven by Codex's **remote compaction v2**: it sends a `compaction_trigger` item (with the full history inline) and expects a single `compaction` output item back. The proxy summarizes the **inline `input` history** (not the empty server-side store) and returns the encrypted/plain summary. Codex then rebuilds its post-compaction history locally. The standalone `POST /v1/responses/compact` endpoint behaves the same way. Server-side store is only populated when a client opts in with `store: true`.
+
+Requests are transparently decompressed (gzip, brotli, zstd, deflate) — Codex sends zstd-compressed bodies. Malformed request bodies produce a structured OpenAI-style `400 invalid_request_error`; the proxy logs only a length-capped, lossy-UTF-8 preview, never raw bytes.
+
 ## Authentication
 
 When `server.auth.keys` contains at least one key, requests to authenticated endpoints require an `Authorization: Bearer <key>` header that matches one of the configured keys. `/health` is always open.

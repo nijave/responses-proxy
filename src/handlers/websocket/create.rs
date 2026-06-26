@@ -81,8 +81,22 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         };
     }
 
+    // Codex remote-compaction-v2 short-circuit: when `input` carries a
+    // `compaction_trigger`, run the summary turn through the shared compaction
+    // helper and emit a single `compaction` output item instead of forwarding
+    // to the chat upstream.
+    if req
+        .input
+        .iter()
+        .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+    {
+        handle_compaction_trigger(state, &provider, socket, req).await;
+        return;
+    }
+
     let model = req.model.clone();
     let generate = req.generate;
+    let store = req.store;
 
     let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -102,6 +116,16 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         }
     };
     chat_req.model = provider.model.clone();
+    if let Some(max_chars) = provider.max_input_chars {
+        let shrunk = crate::convert::enforce_input_budget(&mut chat_req.messages, max_chars);
+        if shrunk > 0 {
+            tracing::info!(
+                max_chars,
+                shrunk_tool_outputs = shrunk,
+                "Input exceeded history.max-input-chars — truncated old tool outputs"
+            );
+        }
+    }
     let mut full_input_messages = chat_req.messages.clone();
 
     // If generate=false, just echo lifecycle events without calling upstream
@@ -145,7 +169,9 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             }
         }
 
-        state.store().put(rid, full_input_messages).await;
+        if store {
+            state.store().put(rid, full_input_messages).await;
+        }
         return;
     }
 
@@ -279,8 +305,9 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
     // Clean up cancel token (run_stream already handled the actual cancellation check)
     state.store().unregister_cancel_token(&rid).await;
 
-    // Persist accumulated history
-    if !cancelled {
+    // Persist accumulated history (only when the client opted into server-side
+    // state; Codex runs store:false and replays history itself).
+    if !cancelled && store {
         // Append assistant response to input messages and store
         let assistant_msg: MessageRequest = response_msg.into();
         let has_reasoning =
@@ -401,6 +428,139 @@ async fn run_stream(
         }
     }
     (ss.to_response_message(), cancelled, collected_events)
+}
+
+/// Run the shared compaction helper and emit a four-event lifecycle on the
+/// WebSocket: `response.created` → `response.in_progress` →
+/// `response.output_item.done` (carrying the single `compaction` item) →
+/// `response.completed`. Mirrors the SSE flow in handlers::responses.
+async fn handle_compaction_trigger(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    socket: &mut WebSocket,
+    req: Request,
+) {
+    // Codex replays the full history in `input` alongside the trigger
+    // (store:false), so the request itself is the summary source.
+    let current_input: Vec<crate::types::item::InputItem> = req
+        .input
+        .iter()
+        .filter(|i| !matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+        .cloned()
+        .collect();
+    let current_messages = crate::convert::items_to_chat_messages(&current_input, state);
+    let (output, usage, created_at) = match crate::handlers::compact::build_compaction_output(
+        state,
+        provider,
+        req.previous_response_id.as_deref(),
+        current_messages,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err((status, body)) => {
+            let message = body
+                .0
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("compaction failed")
+                .to_string();
+            let ws_err = websocket::ErrorEvent::new(
+                status.as_u16(),
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                message,
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+    };
+
+    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let mut resp = Response {
+        id: rid.clone(),
+        model: req.model.clone(),
+        status: ResponseStatus::Completed,
+        created_at,
+        output,
+        usage: Some(usage),
+        ..Default::default()
+    };
+    if let Some(ref meta) = req.metadata {
+        resp.metadata = Some(meta.clone());
+    }
+    resp.previous_response_id = req.previous_response_id.clone();
+    resp.parallel_tool_calls = req.parallel_tool_calls;
+
+    let item = match resp.output.first().cloned() {
+        Some(item) => item,
+        None => {
+            let ws_err = websocket::ErrorEvent::new(
+                500,
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                "compaction helper returned no output".into(),
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+    };
+
+    // Compute persisted summary before `resp` is moved into the Completed event.
+    let store_messages = if req.store {
+        Some(crate::handlers::compaction_output_to_chat_messages(
+            &resp.output,
+            state,
+        ))
+    } else {
+        None
+    };
+
+    let lifecycle = Response {
+        status: ResponseStatus::InProgress,
+        output: vec![],
+        usage: None,
+        ..resp.clone()
+    };
+    let events = [
+        StreamEvent::Created(event::Created {
+            response: lifecycle.clone(),
+            sequence_number: 0,
+        }),
+        StreamEvent::InProgress(event::InProgress {
+            response: lifecycle,
+            sequence_number: 1,
+        }),
+        StreamEvent::OutputItemDone(event::OutputItemDone {
+            item,
+            output_index: 0,
+            sequence_number: 2,
+        }),
+        StreamEvent::Completed(event::Completed {
+            response: resp,
+            sequence_number: 3,
+        }),
+    ];
+    for event in events {
+        match prepare_stream_event(event, &provider.rewrite.responses_out) {
+            Ok(prepared) => super::send(socket, &prepared.body.to_string()).await,
+            Err(message) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    500,
+                    Error::TYPE_SERVER_ERROR,
+                    Error::CODE_SERVER_ERROR,
+                    message,
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        }
+    }
+
+    if let Some(store_messages) = store_messages {
+        state.store().put(rid, store_messages).await;
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use responses_proxy::app;
 use responses_proxy::config;
 use responses_proxy::handlers;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
@@ -91,6 +92,13 @@ async fn main() {
             post(handlers::cancel).route_layer(auth.clone()),
         )
         .layer(cors)
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .zstd(true)
+                .deflate(true),
+        )
         .with_state(state.clone());
 
     tracing::info!("Listening on {}", listen);

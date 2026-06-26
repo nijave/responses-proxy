@@ -576,6 +576,15 @@ pub struct CodeInterpreterCall {
     pub status: String,
 }
 
+/// Compaction trigger input item — Codex CLI sends `{ "type": "compaction_trigger" }`
+/// in `input` to request a remote-compacted summary on the next `/v1/responses` call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactionTrigger {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
 /// Compaction item.  Doc §3.9.s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -592,6 +601,18 @@ pub struct Compaction {
     pub output: Vec<OutputItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+}
+
+/// Context-compaction item — the third compaction shape in the Codex wire
+/// format (alongside `Compaction` and `CompactionTrigger`). Carries an optional
+/// encrypted summary of dropped context. Codex replays it every turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextCompaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
 }
 
 /// Computer call.  Doc §3.9.f.
@@ -895,7 +916,7 @@ pub struct WebSearchCall {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Input item union type — elements of the `input` array in API requests.
-/// Dispatched by `type` field.  26 variants + Unknown catch-all.
+/// Dispatched by `type` field.  27 variants + Unknown catch-all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputItem {
@@ -916,6 +937,8 @@ pub enum InputItem {
     McpApprovalResponse(McpApprovalResponse),
     Reasoning(Reasoning),
     Compaction(Compaction),
+    CompactionTrigger(CompactionTrigger),
+    ContextCompaction(ContextCompaction),
     LocalShellCall(LocalShellCall),
     LocalShellCallOutput(LocalShellCallOutput),
     ShellCall(ShellCall),
@@ -1108,6 +1131,73 @@ mod tests {
         let roundtripped = serde_json::to_value(&item).unwrap();
         assert_eq!(roundtripped["type"], "reasoning");
         assert_eq!(roundtripped["id"], "rs_abc");
+    }
+
+    #[test]
+    fn input_item_compaction_trigger_deserializes() {
+        let json = serde_json::json!({ "type": "compaction_trigger" });
+        let item: InputItem = serde_json::from_value(json).unwrap();
+        match &item {
+            InputItem::CompactionTrigger(t) => assert!(t.metadata.is_none()),
+            _ => panic!("expected CompactionTrigger variant, got {item:?}"),
+        }
+        let roundtripped = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            roundtripped,
+            serde_json::json!({ "type": "compaction_trigger" })
+        );
+    }
+
+    #[test]
+    fn input_item_context_compaction_roundtrip() {
+        let json = serde_json::json!({
+            "type": "context_compaction",
+            "encrypted_content": "ENC",
+        });
+        let item: InputItem = serde_json::from_value(json.clone()).unwrap();
+        match &item {
+            InputItem::ContextCompaction(c) => {
+                assert_eq!(c.encrypted_content.as_deref(), Some("ENC"));
+            }
+            _ => panic!("expected ContextCompaction variant, got {item:?}"),
+        }
+        assert_eq!(serde_json::to_value(&item).unwrap(), json);
+    }
+
+    #[test]
+    fn input_item_image_generation_call_not_unknown() {
+        // Codex replays image_generation_call items every turn; they must
+        // deserialize into the typed variant, not the Unknown catch-all.
+        let json = serde_json::json!({
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "result": "BASE64DATA",
+        });
+        let item: InputItem = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(item, InputItem::ImageGenerationCall(_)),
+            "expected ImageGenerationCall, got {item:?}"
+        );
+    }
+
+    #[test]
+    fn input_item_compaction_trigger_with_metadata_roundtrip() {
+        let json = serde_json::json!({
+            "type": "compaction_trigger",
+            "metadata": { "reason": "user_command" },
+        });
+        let item: InputItem = serde_json::from_value(json.clone()).unwrap();
+        match &item {
+            InputItem::CompactionTrigger(t) => {
+                assert_eq!(
+                    t.metadata.as_ref().and_then(|m| m.get("reason")),
+                    Some(&serde_json::Value::String("user_command".into())),
+                );
+            }
+            _ => panic!("expected CompactionTrigger variant"),
+        }
+        assert_eq!(serde_json::to_value(&item).unwrap(), json);
     }
 
     #[test]

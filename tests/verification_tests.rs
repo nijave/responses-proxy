@@ -41,6 +41,7 @@ fn test_state_with_rewrite(
                 chat_out: rewrite,
                 ..Default::default()
             },
+            max_input_chars: None,
         },
     );
 

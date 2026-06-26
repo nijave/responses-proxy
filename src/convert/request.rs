@@ -116,6 +116,7 @@ pub async fn responses_to_chat(
     // Walk input items
     let items: Vec<InputItem> = req.input;
     if !items.is_empty() {
+        let cutoff = old_tool_output_cutoff(&items, KEEP_LAST_TURNS);
         let mut deferred: Vec<chat::MessageRequest> = Vec::new();
         let mut pending_tool_calls: Vec<chat::ToolCallRequest> = Vec::new();
 
@@ -135,7 +136,7 @@ pub async fn responses_to_chat(
             }
         };
 
-        for item in items.into_iter() {
+        for (idx, item) in items.into_iter().enumerate() {
             match item {
                 InputItem::FunctionCallOutput(fco) => {
                     let cs = match &fco.output {
@@ -145,7 +146,7 @@ pub async fn responses_to_chat(
                         }
                     };
                     deferred.push(chat::MessageRequest::Tool(chat::ToolMessage {
-                        content: chat::MessageContent::Text(cs),
+                        content: chat::MessageContent::Text(tool_output_for_age(cs, idx, cutoff)),
                         tool_call_id: fco.call_id.clone(),
                     }));
                 }
@@ -158,6 +159,7 @@ pub async fn responses_to_chat(
                     messages.append(&mut deferred);
                     if let Some(t) = extract_reasoning(&r, state.compact_key()) {
                         pending_reasoning = Some(match pending_reasoning.take() {
+                            Some(e) if e.contains(&t) => e,
                             Some(e) => format!("{}\n{}", e, t),
                             None => t,
                         });
@@ -171,6 +173,24 @@ pub async fn responses_to_chat(
                     );
                     messages.append(&mut deferred);
                     // Decrypt encrypted_content into a system message
+                    if let Some(ref encrypted) = c.encrypted_content
+                        && let Some(key) = state.compact_key()
+                        && let Some(decrypted) = crate::crypto::decrypt(key, encrypted)
+                        && !decrypted.is_empty()
+                    {
+                        messages.push(chat::MessageRequest::System(chat::SystemMessage {
+                            content: chat::MessageContent::Text(decrypted),
+                            name: None,
+                        }));
+                    }
+                }
+                InputItem::ContextCompaction(c) => {
+                    flush_tools(
+                        &mut messages,
+                        &mut pending_tool_calls,
+                        &mut pending_reasoning,
+                    );
+                    messages.append(&mut deferred);
                     if let Some(ref encrypted) = c.encrypted_content
                         && let Some(key) = state.compact_key()
                         && let Some(decrypted) = crate::crypto::decrypt(key, encrypted)
@@ -226,13 +246,23 @@ pub async fn responses_to_chat(
                         }
                     };
                     deferred.push(chat::MessageRequest::Tool(chat::ToolMessage {
-                        content: chat::MessageContent::Text(cs),
+                        content: chat::MessageContent::Text(tool_output_for_age(cs, idx, cutoff)),
                         tool_call_id: ctco.call_id.clone(),
                     }));
                 }
+                // Trigger for remote compaction v2: handled before reaching the
+                // chat converter, so silently drop if it slips through here.
+                InputItem::CompactionTrigger(_) => {}
+                // Items Codex replays every turn that have no Chat-Completions
+                // equivalent. Drop silently — they carry large opaque payloads
+                // (image base64, search results) that must not be logged.
+                InputItem::WebSearchCall(_)
+                | InputItem::ImageGenerationCall(_)
+                | InputItem::ToolSearchCall(_)
+                | InputItem::ToolSearchOutput(_) => {}
                 other => {
                     tracing::warn!(
-                        item = ?other,
+                        item = %unconvertible_item_label(&other),
                         "InputItem variant not convertible to Chat API — skipping"
                     );
                 }
@@ -407,12 +437,154 @@ fn convert_tool_choice(tc: crate::types::tool::ToolChoice) -> Option<chat::ToolC
     }
 }
 
+// ── Tool-output truncation (age-based) ────────────────────────────────────
+//
+// Tool outputs dominate replayed context (~78% of bytes in real Codex
+// sessions). Outputs from the last `KEEP_LAST_TURNS` user turns are kept
+// verbatim because the model is likely still acting on them; older ones are
+// truncated to head+tail with a marker.
+
+const KEEP_LAST_TURNS: usize = 6;
+const MAX_OLD_TOOL_OUTPUT_CHARS: usize = 2048;
+const OLD_TOOL_OUTPUT_HEAD: usize = 1024;
+const OLD_TOOL_OUTPUT_TAIL: usize = 512;
+
+/// Index in `items` before which tool outputs are "old" and may be truncated.
+/// Everything from this index onward belongs to the last `keep_last_turns`
+/// user turns and is preserved verbatim. Returns 0 when there are not enough
+/// turns to truncate anything.
+fn old_tool_output_cutoff(items: &[InputItem], keep_last_turns: usize) -> usize {
+    let user_positions: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| matches!(it, InputItem::Message(m) if m.role == MessageRole::User))
+        .map(|(i, _)| i)
+        .collect();
+    if user_positions.len() <= keep_last_turns {
+        return 0;
+    }
+    user_positions[user_positions.len() - keep_last_turns]
+}
+
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Truncate an old tool output to head+tail with a marker, respecting UTF-8
+/// boundaries. Returns the input unchanged when within budget or when the
+/// head+tail would not actually save anything.
+fn truncate_old_tool_output(s: String) -> String {
+    if s.len() <= MAX_OLD_TOOL_OUTPUT_CHARS {
+        return s;
+    }
+    let head_end = floor_char_boundary(&s, OLD_TOOL_OUTPUT_HEAD);
+    let tail_start = ceil_char_boundary(&s, s.len().saturating_sub(OLD_TOOL_OUTPUT_TAIL));
+    if tail_start <= head_end {
+        return s;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n…[truncated {} bytes]…\n{}",
+        &s[..head_end],
+        omitted,
+        &s[tail_start..]
+    )
+}
+
+/// Apply age-based truncation to a tool-output string given its item index and
+/// the precomputed cutoff.
+fn tool_output_for_age(cs: String, idx: usize, cutoff: usize) -> String {
+    if idx < cutoff {
+        truncate_old_tool_output(cs)
+    } else {
+        cs
+    }
+}
+
+/// Serialized character size of a converted Chat message list.
+fn messages_total_chars(messages: &[chat::MessageRequest]) -> usize {
+    messages
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+        .sum()
+}
+
+/// Enforce a total character ceiling on a converted Chat request. Age-based
+/// truncation shrinks per-output; this is the global backstop the per-model
+/// `history.max-input-chars` config drives. It walks tool messages from oldest
+/// to newest, replacing their content with a head+tail marker, until the total
+/// serialized size fits under `max_chars` (or no tool output remains to shrink).
+/// Tool-call/output pairing is never broken — only the textual content shrinks.
+/// Returns the number of messages whose content was reduced.
+pub fn enforce_input_budget(messages: &mut [chat::MessageRequest], max_chars: usize) -> usize {
+    if messages_total_chars(messages) <= max_chars {
+        return 0;
+    }
+    let mut shrunk = 0;
+    for idx in 0..messages.len() {
+        if let chat::MessageRequest::Tool(t) = &messages[idx] {
+            let text = match &t.content {
+                chat::MessageContent::Text(s) => s.clone(),
+                chat::MessageContent::Parts(parts) => {
+                    parts.iter().map(|p| p.text.as_str()).collect::<String>()
+                }
+            };
+            if text.len() > MAX_OLD_TOOL_OUTPUT_CHARS {
+                let truncated = truncate_old_tool_output(text);
+                if let chat::MessageRequest::Tool(t) = &mut messages[idx] {
+                    t.content = chat::MessageContent::Text(truncated);
+                }
+                shrunk += 1;
+                if messages_total_chars(messages) <= max_chars {
+                    break;
+                }
+            }
+        }
+    }
+    shrunk
+}
+
+/// A short, log-safe label for an input item that the converter does not map to
+/// a Chat message. Codex replays large items (image base64, encrypted
+/// summaries) that must never be logged verbatim — only the discriminant `type`
+/// and length are emitted.
+fn unconvertible_item_label(item: &InputItem) -> String {
+    match serde_json::to_value(item) {
+        Ok(value) => {
+            let kind = value
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let bytes = value.to_string().len();
+            format!("{kind} ({bytes} bytes)")
+        }
+        Err(_) => "unserializable".to_string(),
+    }
+}
+
 // ── Bulk conversion: Vec<InputItem> → Vec<MessageRequest> ─
 
 pub fn items_to_chat_messages(
     items: &[InputItem],
     state: &crate::app::State,
 ) -> Vec<chat::MessageRequest> {
+    let cutoff = old_tool_output_cutoff(items, KEEP_LAST_TURNS);
     let mut messages: Vec<chat::MessageRequest> = Vec::new();
     let mut pending_reasoning: Option<String> = None;
     let mut deferred: Vec<chat::MessageRequest> = Vec::new();
@@ -434,7 +606,7 @@ pub fn items_to_chat_messages(
         }
     };
 
-    for item in items {
+    for (idx, item) in items.iter().enumerate() {
         match item {
             InputItem::FunctionCallOutput(fco) => {
                 let cs = match &fco.output {
@@ -442,7 +614,7 @@ pub fn items_to_chat_messages(
                     FunctionOutputValue::Array(blocks) => extract_text_from_output_blocks(blocks),
                 };
                 deferred.push(chat::MessageRequest::Tool(chat::ToolMessage {
-                    content: chat::MessageContent::Text(cs),
+                    content: chat::MessageContent::Text(tool_output_for_age(cs, idx, cutoff)),
                     tool_call_id: fco.call_id.clone(),
                 }));
             }
@@ -455,6 +627,7 @@ pub fn items_to_chat_messages(
                 messages.append(&mut deferred);
                 if let Some(t) = extract_reasoning(r, state.compact_key()) {
                     pending_reasoning = Some(match pending_reasoning.take() {
+                        Some(e) if e.contains(&t) => e,
                         Some(e) => format!("{}\n{}", e, t),
                         None => t,
                     });
@@ -468,6 +641,24 @@ pub fn items_to_chat_messages(
                 );
                 messages.append(&mut deferred);
                 // Decrypt encrypted_content into a system message
+                if let Some(ref encrypted) = c.encrypted_content
+                    && let Some(key) = state.compact_key()
+                    && let Some(text) = crate::crypto::decrypt(key, encrypted)
+                    && !text.is_empty()
+                {
+                    messages.push(chat::MessageRequest::System(chat::SystemMessage {
+                        content: chat::MessageContent::Text(text),
+                        name: None,
+                    }));
+                }
+            }
+            InputItem::ContextCompaction(c) => {
+                flush(
+                    &mut messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                );
+                messages.append(&mut deferred);
                 if let Some(ref encrypted) = c.encrypted_content
                     && let Some(key) = state.compact_key()
                     && let Some(text) = crate::crypto::decrypt(key, encrypted)
@@ -521,13 +712,21 @@ pub fn items_to_chat_messages(
                     CustomToolOutputValue::Array(blocks) => extract_text_from_output_blocks(blocks),
                 };
                 deferred.push(chat::MessageRequest::Tool(chat::ToolMessage {
-                    content: chat::MessageContent::Text(cs),
+                    content: chat::MessageContent::Text(tool_output_for_age(cs, idx, cutoff)),
                     tool_call_id: ctco.call_id.clone(),
                 }));
             }
+            // Trigger for remote compaction v2 — handled upstream of conversion.
+            InputItem::CompactionTrigger(_) => {}
+            // Items Codex replays every turn with no Chat-Completions
+            // equivalent. Drop silently — large opaque payloads.
+            InputItem::WebSearchCall(_)
+            | InputItem::ImageGenerationCall(_)
+            | InputItem::ToolSearchCall(_)
+            | InputItem::ToolSearchOutput(_) => {}
             other => {
                 tracing::warn!(
-                    item = ?other,
+                    item = %unconvertible_item_label(other),
                     "InputItem variant not convertible to Chat API in items_to_chat_messages — skipping"
                 );
             }
@@ -718,5 +917,128 @@ fn extract_reasoning(r: &Reasoning, decrypt_key: Option<&[u8; 32]>) -> Option<St
         None
     } else {
         Some(parts.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(text: &str) -> InputItem {
+        InputItem::Message(InputMessage {
+            role: MessageRole::User,
+            content: vec![InputContentBlock::Text {
+                text: text.to_string(),
+            }],
+            status: None,
+        })
+    }
+
+    fn tool_out(call_id: &str, output: &str) -> InputItem {
+        InputItem::FunctionCallOutput(FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionOutputValue::String(output.to_string()),
+            id: None,
+            status: None,
+        })
+    }
+
+    #[test]
+    fn cutoff_zero_when_few_turns() {
+        let items = vec![user("a"), tool_out("c1", "x"), user("b")];
+        assert_eq!(old_tool_output_cutoff(&items, 6), 0);
+    }
+
+    #[test]
+    fn cutoff_marks_old_turns() {
+        // 8 user turns, keep last 6 → cutoff at the 3rd user position (index 2).
+        let mut items = Vec::new();
+        for _ in 0..8 {
+            items.push(user("u"));
+        }
+        let cutoff = old_tool_output_cutoff(&items, 6);
+        // user positions are 0..8; keep last 6 → boundary at position index 2.
+        assert_eq!(cutoff, 2);
+    }
+
+    #[test]
+    fn truncate_old_output_adds_marker() {
+        let big = "A".repeat(10_000);
+        let out = truncate_old_tool_output(big);
+        assert!(out.contains("…[truncated"));
+        assert!(out.starts_with(&"A".repeat(OLD_TOOL_OUTPUT_HEAD)));
+        assert!(out.ends_with(&"A".repeat(OLD_TOOL_OUTPUT_TAIL)));
+        assert!(out.len() < 10_000);
+    }
+
+    #[test]
+    fn truncate_keeps_small_output() {
+        let small = "tiny".to_string();
+        assert_eq!(truncate_old_tool_output(small.clone()), small);
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundaries() {
+        // Multi-byte chars around the cut points must not panic or split.
+        let s = "𝔘".repeat(5_000); // 4 bytes each = 20_000 bytes
+        let out = truncate_old_tool_output(s);
+        assert!(out.contains("…[truncated"));
+        // Round-trips as valid UTF-8 (String guarantees it; assert non-empty cut).
+        assert!(out.len() < 20_000);
+    }
+
+    #[test]
+    fn tool_output_for_age_truncates_only_old() {
+        let big = "B".repeat(10_000);
+        // idx < cutoff → truncated
+        let old = tool_output_for_age(big.clone(), 0, 5);
+        assert!(old.contains("…[truncated"));
+        // idx >= cutoff → verbatim
+        let fresh = tool_output_for_age(big.clone(), 5, 5);
+        assert_eq!(fresh, big);
+    }
+
+    fn tool_msg(call_id: &str, text: &str) -> chat::MessageRequest {
+        chat::MessageRequest::Tool(chat::ToolMessage {
+            content: chat::MessageContent::Text(text.to_string()),
+            tool_call_id: call_id.to_string(),
+        })
+    }
+
+    #[test]
+    fn enforce_budget_noop_when_within_limit() {
+        let mut msgs = vec![tool_msg("c1", "small")];
+        assert_eq!(enforce_input_budget(&mut msgs, 1_000_000), 0);
+        match &msgs[0] {
+            chat::MessageRequest::Tool(t) => match &t.content {
+                chat::MessageContent::Text(s) => assert_eq!(s, "small"),
+                _ => panic!("expected text content"),
+            },
+            _ => panic!("expected tool message"),
+        }
+    }
+
+    #[test]
+    fn enforce_budget_shrinks_oldest_first_and_preserves_pairing() {
+        // Two big tool outputs; budget only fits one truncated + one full.
+        let mut msgs = vec![
+            tool_msg("call_old", &"O".repeat(20_000)),
+            tool_msg("call_new", &"N".repeat(5_000)),
+        ];
+        let before = messages_total_chars(&msgs);
+        let shrunk = enforce_input_budget(&mut msgs, before - 10_000);
+        assert!(shrunk >= 1, "should have truncated at least one output");
+        // tool_call_id pairing untouched.
+        match &msgs[0] {
+            chat::MessageRequest::Tool(t) => {
+                assert_eq!(t.tool_call_id, "call_old");
+                match &t.content {
+                    chat::MessageContent::Text(s) => assert!(s.contains("…[truncated")),
+                    _ => panic!("expected text"),
+                }
+            }
+            _ => panic!("expected tool message"),
+        }
+        assert!(messages_total_chars(&msgs) < before);
     }
 }

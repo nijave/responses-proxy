@@ -1,6 +1,13 @@
 # Example: drive Codex CLI through this proxy against a generic
 # OpenAI-Chat-Completions-compatible API gateway.
 #
+# Codex's `/compact` command (remote compaction v2) sends a regular
+# `POST /v1/responses` whose `input` contains a single
+# `{ "type": "compaction_trigger" }` item and expects a single
+# `compaction` output item back. The proxy detects the trigger and
+# routes through its built-in summary pipeline transparently — no extra
+# rewrites are needed below.
+#
 # Build:
 #   cargo build --release
 #

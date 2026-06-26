@@ -1,3 +1,4 @@
+use crate::config::ResolvedProvider;
 use crate::types::chat::{self, Completion, MessageRequest};
 use crate::types::item::{Compaction, OutputContentBlock, OutputItem, OutputMessage};
 use crate::types::responses::{self, CompactedResponse, Error, Request};
@@ -12,17 +13,60 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 /// compaction output item.
 pub async fn compact(
     State(state): State<crate::app::State>,
-    Json(req): Json<Request>,
+    super::json::ResponsesJson(req): super::json::ResponsesJson<Request>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // Walk the stored continuation chain so compaction sees the same replay
-    // history that previous_response_id continuation would use.
-    let mut messages: Vec<MessageRequest> = match req.previous_response_id {
-        Some(ref pid) => state
-            .store()
-            .get(pid)
-            .await
-            .unwrap_or(Vec::with_capacity(req.input.len())),
-        None => vec![],
+    let provider = state.config().models.get(&req.model).ok_or_else(|| {
+        let err = Error::invalid_request(format!("Unknown model: {}", req.model));
+        (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
+    })?;
+
+    // The standalone endpoint also carries the live history in `req.input`
+    // (Codex replays it every turn under store:false), so convert it and use it
+    // as the summary source.
+    let current_messages = crate::convert::items_to_chat_messages(&req.input, &state);
+    let (output, usage, created_at) = build_compaction_output(
+        &state,
+        provider,
+        req.previous_response_id.as_deref(),
+        current_messages,
+    )
+    .await?;
+
+    Ok(Json(CompactedResponse {
+        id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+        object: "response.compaction".into(),
+        created_at,
+        output,
+        usage,
+    }))
+}
+
+/// Run a summary turn against the configured provider and wrap the result in a
+/// `compaction` output item. Returns `(output, usage, created_at)` so callers
+/// can package the data into either a `CompactedResponse` (for the standalone
+/// `/v1/responses/compact` endpoint) or a normal `responses::Response` /
+/// SSE stream (for the in-band `compaction_trigger` flow on `/v1/responses`).
+///
+/// `current_messages` is the live history converted from the request's `input`
+/// items. Codex CLI runs with `store:false` and replays the full conversation
+/// in `input` on every turn, so the request itself is the authoritative source
+/// of history; the stored continuation chain (keyed by `previous_response_id`)
+/// is only a fallback for clients that rely on server-side state.
+pub(crate) async fn build_compaction_output(
+    state: &crate::app::State,
+    provider: &ResolvedProvider,
+    previous_response_id: Option<&str>,
+    current_messages: Vec<MessageRequest>,
+) -> Result<(Vec<OutputItem>, responses::Usage, i64), (StatusCode, Json<serde_json::Value>)> {
+    // Prefer the live history replayed in `input`; fall back to the stored
+    // continuation chain only when the request carried no history.
+    let mut messages: Vec<MessageRequest> = if !current_messages.is_empty() {
+        current_messages
+    } else {
+        match previous_response_id {
+            Some(pid) => state.store().get(pid).await.unwrap_or_default(),
+            None => vec![],
+        }
     };
 
     // Append the summary prompt as a user message
@@ -33,12 +77,6 @@ pub async fn compact(
         }]),
         name: None,
     }));
-
-    // Look up the model provider
-    let provider = state.config().models.get(&req.model).ok_or_else(|| {
-        let err = Error::invalid_request(format!("Unknown model: {}", req.model));
-        (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
-    })?;
 
     // Build upstream request (non-streaming, no tools, reasoning disabled)
     let upstream_req = chat::Request {
@@ -168,11 +206,5 @@ pub async fn compact(
         })]
     };
 
-    Ok(Json(CompactedResponse {
-        id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-        object: "response.compaction".into(),
-        created_at: chat_resp.created,
-        output,
-        usage,
-    }))
+    Ok((output, usage, chat_resp.created))
 }

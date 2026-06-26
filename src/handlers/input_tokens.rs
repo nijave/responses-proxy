@@ -11,7 +11,7 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 /// Uses a simple chars/4 heuristic (common approximation for English text).
 pub async fn input_tokens(
     State(state): State<crate::app::State>,
-    Json(req): Json<Request>,
+    super::json::ResponsesJson(req): super::json::ResponsesJson<Request>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let chat_req = responses_to_chat(req, &state)
         .await

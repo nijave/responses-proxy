@@ -92,6 +92,18 @@ pub struct ModelEntry {
     pub model: Option<String>,
     #[serde(default)]
     pub rewrite: Option<RewriteEntry>,
+    #[serde(default)]
+    pub history: Option<HistoryConfig>,
+}
+
+/// Per-model history controls. `max-input-chars` caps the total size of the
+/// converted Chat request; when the replayed history exceeds it, the oldest
+/// tool outputs are truncated until the request fits.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HistoryConfig {
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -522,6 +534,8 @@ pub struct ResolvedProvider {
     pub model: String,
     pub timeout: Duration,
     pub rewrite: RewriteProfile,
+    /// Total character ceiling for the converted Chat request, if configured.
+    pub max_input_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -587,6 +601,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
             .timeout
             .map(Duration::from_secs)
             .unwrap_or(default_timeout);
+        let max_input_chars = entry.history.as_ref().and_then(|h| h.max_input_chars);
 
         models.insert(
             logical_name.clone(),
@@ -596,6 +611,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 model,
                 timeout,
                 rewrite,
+                max_input_chars,
             },
         );
         model_names.push(logical_name.clone());

@@ -21,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 /// POST /v1/responses — handles both streaming and non-streaming responses.
 pub async fn responses(
     State(state): State<crate::app::State>,
-    Json(mut req): Json<ResponsesRequest>,
+    super::json::ResponsesJson(mut req): super::json::ResponsesJson<ResponsesRequest>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let provider = state
         .config()
@@ -54,6 +54,17 @@ pub async fn responses(
         })?;
     }
 
+    // Codex remote-compaction-v2 short-circuit: when `input` carries a
+    // `compaction_trigger`, run the summary turn through the shared compaction
+    // helper and return a single `compaction` output instead of a chat reply.
+    if req
+        .input
+        .iter()
+        .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+    {
+        return handle_compaction_trigger(&state, &provider, req).await;
+    }
+
     let model = req.model.clone();
     let is_stream = req.stream;
     let provider_model = provider.model.clone();
@@ -71,13 +82,26 @@ pub async fn responses(
                 (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
             })?;
         cr.model = provider_model.clone();
+        if let Some(max_chars) = provider.max_input_chars {
+            let shrunk = crate::convert::enforce_input_budget(&mut cr.messages, max_chars);
+            if shrunk > 0 {
+                tracing::info!(
+                    max_chars,
+                    shrunk_tool_outputs = shrunk,
+                    "Input exceeded history.max-input-chars — truncated old tool outputs"
+                );
+            }
+        }
         let input_msgs = cr.messages.clone();
         (cr, input_msgs)
     };
+    let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
     tracing::info!(
         model = %model,
         upstream = %provider_model,
         messages = chat_req.messages.len(),
+        messages_chars,
+        tool_output_chars,
         stream = is_stream,
         endpoint = %endpoint,
         "Forwarding request"
@@ -154,6 +178,30 @@ pub async fn responses(
             .await
             .map(|j| j.into_response())
     }
+}
+
+// ── Telemetry ──────────────────────────────────────────────────────────────
+
+/// Returns `(total_chars, tool_output_chars)` for an outgoing message list.
+/// Used to track context bloat — tool outputs dominate replayed history.
+fn message_size_metrics(messages: &[crate::types::chat::MessageRequest]) -> (usize, usize) {
+    use crate::types::chat::{MessageContent, MessageRequest};
+    let content_len = |c: &MessageContent| -> usize {
+        match c {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Parts(parts) => parts.iter().map(|p| p.text.len()).sum(),
+        }
+    };
+    let mut total = 0;
+    let mut tool = 0;
+    for m in messages {
+        let len = serde_json::to_string(m).map(|s| s.len()).unwrap_or(0);
+        total += len;
+        if let MessageRequest::Tool(t) = m {
+            tool += content_len(&t.content);
+        }
+    }
+    (total, tool)
 }
 
 // ── Shared upstream call ──────────────────────────────────────────────────
@@ -518,6 +566,204 @@ async fn handle_streaming(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+// ── Remote compaction v2 trigger ─────────────────────────────────────────
+
+/// Handle a `/v1/responses` request whose `input` contains a
+/// `compaction_trigger`. Builds the summary via the shared compaction helper
+/// and returns a single `compaction` output item as either JSON (non-stream)
+/// or a three-event SSE stream (`response.created` →
+/// `response.output_item.done` → `response.completed`).
+async fn handle_compaction_trigger(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    req: ResponsesRequest,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // Codex replays the full history in `input` alongside the trigger
+    // (store:false), so the request itself is the summary source.
+    let current_input: Vec<crate::types::item::InputItem> = req
+        .input
+        .iter()
+        .filter(|i| !matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+        .cloned()
+        .collect();
+    let current_messages = items_to_chat_messages(&current_input, state);
+    let (output, usage, created_at) = crate::handlers::compact::build_compaction_output(
+        state,
+        provider,
+        req.previous_response_id.as_deref(),
+        current_messages,
+    )
+    .await?;
+
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let mut resp = crate::types::responses::Response {
+        id: response_id.clone(),
+        model: req.model.clone(),
+        status: ResponseStatus::Completed,
+        created_at,
+        output,
+        usage: Some(usage),
+        ..Default::default()
+    };
+    if let Some(ref meta) = req.metadata {
+        resp.metadata = Some(meta.clone());
+    }
+    resp.previous_response_id = req.previous_response_id.clone();
+    resp.parallel_tool_calls = req.parallel_tool_calls;
+
+    // Persist the compaction summary so a follow-up `previous_response_id`
+    // lookup replays it (clients using server-side state). Codex itself runs
+    // store:false and rebuilds history locally, so this only matters for
+    // store:true clients.
+    if req.store {
+        let store_messages = compaction_output_to_chat_messages(&resp.output, state);
+        state.store().put(response_id.clone(), store_messages).await;
+    }
+
+    if req.stream {
+        return stream_compaction_trigger(provider, resp).await;
+    }
+
+    if provider.rewrite.responses_out.is_empty() {
+        return Ok(Json(resp).into_response());
+    }
+
+    let mut body = serde_json::to_value(&resp).map_err(|e| {
+        let err = Error::server_error(e.to_string());
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+    })?;
+    crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.responses_out).map_err(|msg| {
+        let err = Error::server_error(msg);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+    })?;
+    Ok(Json(body).into_response())
+}
+
+/// Convert a compaction trigger's output items into the chat messages to store
+/// under the response id, so a follow-up `previous_response_id` continuation
+/// replays the summary as a leading system message. Mirrors how
+/// `InputItem::Compaction` is decrypted in `items_to_chat_messages`.
+pub(crate) fn compaction_output_to_chat_messages(
+    output: &[crate::types::item::OutputItem],
+    state: &crate::app::State,
+) -> Vec<crate::types::chat::MessageRequest> {
+    use crate::types::chat::{MessageContent, MessageRequest, SystemMessage};
+    use crate::types::item::{Compaction, InputItem, OutputContentBlock, OutputItem};
+
+    let mut messages = Vec::new();
+    for item in output {
+        let OutputItem::Compaction(compaction) = item else {
+            continue;
+        };
+        if compaction.encrypted_content.is_some() {
+            // Reuse the input-side decrypt path for parity.
+            let input = vec![InputItem::Compaction(Compaction {
+                id: compaction.id.clone(),
+                encrypted_content: compaction.encrypted_content.clone(),
+                status: compaction.status.clone(),
+                output: vec![],
+                created_by: compaction.created_by.clone(),
+            })];
+            messages.extend(items_to_chat_messages(&input, state));
+        } else {
+            // Plain-text summary embedded in nested output message(s).
+            let text = compaction
+                .output
+                .iter()
+                .filter_map(|o| match o {
+                    OutputItem::Message(m) => Some(
+                        m.content
+                            .iter()
+                            .filter_map(|b| match b {
+                                OutputContentBlock::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                messages.push(MessageRequest::System(SystemMessage {
+                    content: MessageContent::Text(text),
+                    name: None,
+                }));
+            }
+        }
+    }
+    messages
+}
+
+async fn stream_compaction_trigger(
+    provider: &crate::config::ResolvedProvider,
+    resp: crate::types::responses::Response,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    use crate::types::event::{Completed, Created, InProgress, OutputItemDone};
+    let responses_out = provider.rewrite.responses_out.clone();
+
+    // The compaction item lives at output_index 0 — there is only ever one in
+    // this response (Codex's collect_compaction_output asserts exactly one).
+    let item = resp.output.first().cloned().ok_or_else(|| {
+        let err = Error::server_error("compaction helper returned no output");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+    })?;
+    // Lifecycle payload mirrors the normal streaming flow: created/in_progress
+    // carry an empty output and `in_progress` status; completed carries the
+    // full response.
+    let lifecycle = crate::types::responses::Response {
+        status: ResponseStatus::InProgress,
+        output: vec![],
+        usage: None,
+        ..resp.clone()
+    };
+    let events = vec![
+        StreamEvent::Created(Created {
+            response: lifecycle.clone(),
+            sequence_number: 0,
+        }),
+        StreamEvent::InProgress(InProgress {
+            response: lifecycle,
+            sequence_number: 1,
+        }),
+        StreamEvent::OutputItemDone(OutputItemDone {
+            item,
+            output_index: 0,
+            sequence_number: 2,
+        }),
+        StreamEvent::Completed(Completed {
+            response: resp,
+            sequence_number: 3,
+        }),
+    ];
+
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(8);
+    for event in events {
+        let prepared = crate::types::streaming::prepare_stream_event(event, &responses_out)
+            .map_err(|msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
+        let sse_event = SseEvent::default()
+            .event(prepared.event_type)
+            .json_data(prepared.body)
+            .map_err(|e| {
+                let err = Error::server_error(e.to_string());
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
+        if tx.send(Ok(sse_event)).await.is_err() {
+            break;
+        }
+    }
+    drop(tx);
+
+    Ok(Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 fn build_stream_lifecycle_response(
@@ -938,5 +1184,31 @@ mod tests {
         assert_eq!(resp.id, "resp_empty");
         assert_eq!(resp.output.len(), 0);
         assert!(resp.usage.is_none());
+    }
+
+    // ── compaction_trigger detection ────────────────────────────────────────
+
+    #[test]
+    fn detects_compaction_trigger_in_input() {
+        use crate::types::item::{CompactionTrigger, InputItem};
+        let input = [InputItem::CompactionTrigger(CompactionTrigger::default())];
+        assert!(
+            input
+                .iter()
+                .any(|i| matches!(i, InputItem::CompactionTrigger(_)))
+        );
+    }
+
+    #[test]
+    fn plain_input_is_not_a_compaction_trigger() {
+        let json = serde_json::json!([
+            { "type": "message", "role": "user", "content": "hi" }
+        ]);
+        let input: Vec<crate::types::item::InputItem> = serde_json::from_value(json).unwrap();
+        assert!(
+            !input
+                .iter()
+                .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+        );
     }
 }
