@@ -559,6 +559,62 @@ pub fn enforce_input_budget(messages: &mut [chat::MessageRequest], max_chars: us
     shrunk
 }
 
+/// Trim the converted Chat message list to at most `max_messages` by dropping
+/// the oldest conversation turns. Leading System/Developer messages (the
+/// instructions block) are always kept. Cuts only at user-message boundaries so
+/// assistant tool_calls stay paired with their tool responses. Returns the
+/// number of messages dropped. `max_messages == 0` means unlimited.
+pub fn enforce_message_budget(
+    messages: &mut Vec<chat::MessageRequest>,
+    max_messages: usize,
+) -> usize {
+    if max_messages == 0 || messages.len() <= max_messages {
+        return 0;
+    }
+
+    // Leading run of System/Developer messages — always retained.
+    let prefix_len = messages
+        .iter()
+        .take_while(|m| {
+            matches!(
+                m,
+                chat::MessageRequest::System(_) | chat::MessageRequest::Developer(_)
+            )
+        })
+        .count();
+
+    // User-message positions after the prefix — each starts a conversation turn.
+    let user_starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .skip(prefix_len)
+        .filter(|(_, m)| matches!(m, chat::MessageRequest::User(_)))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Earliest turn start that makes prefix + tail fit under the limit. Falls
+    // back to the last turn if even one turn plus prefix still overflows (a
+    // single enormous turn we cannot split without breaking tool pairing).
+    let start = match user_starts
+        .iter()
+        .copied()
+        .find(|&s| prefix_len + (messages.len() - s) <= max_messages)
+    {
+        Some(s) => s,
+        None => match user_starts.last() {
+            Some(&s) => s,
+            None => return 0,
+        },
+    };
+
+    if start <= prefix_len {
+        return 0;
+    }
+    let removed = start - prefix_len;
+    messages.drain(prefix_len..start);
+    removed
+}
+
 /// A short, log-safe label for an input item that the converter does not map to
 /// a Chat message. Codex replays large items (image base64, encrypted
 /// summaries) that must never be logged verbatim — only the discriminant `type`
@@ -1003,6 +1059,106 @@ mod tests {
             content: chat::MessageContent::Text(text.to_string()),
             tool_call_id: call_id.to_string(),
         })
+    }
+
+    fn sys_msg(text: &str) -> chat::MessageRequest {
+        chat::MessageRequest::System(chat::SystemMessage {
+            content: chat::MessageContent::Text(text.to_string()),
+            name: None,
+        })
+    }
+
+    fn user_msg(text: &str) -> chat::MessageRequest {
+        chat::MessageRequest::User(chat::UserMessage {
+            content: chat::UserContent::Text(text.to_string()),
+            name: None,
+        })
+    }
+
+    fn assistant_msg(text: &str) -> chat::MessageRequest {
+        chat::MessageRequest::Assistant(chat::AssistantMessage {
+            content: Some(chat::AssistantContent::Text(text.to_string())),
+            name: None,
+            refusal: None,
+            audio: None,
+            tool_calls: None,
+            function_call: None,
+            reasoning_content: None,
+        })
+    }
+
+    #[test]
+    fn message_budget_noop_when_within_limit() {
+        let mut msgs = vec![sys_msg("s"), user_msg("u"), assistant_msg("a")];
+        assert_eq!(enforce_message_budget(&mut msgs, 10), 0);
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn message_budget_zero_is_unlimited() {
+        let mut msgs = vec![user_msg("u1"), user_msg("u2"), user_msg("u3")];
+        assert_eq!(enforce_message_budget(&mut msgs, 0), 0);
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn message_budget_drops_oldest_turns_keeps_prefix() {
+        // system prefix + 4 turns of (user, assistant). Limit 5 → keep prefix
+        // (1) + last 2 turns (4) = 5.
+        let mut msgs = vec![sys_msg("s")];
+        for i in 0..4 {
+            msgs.push(user_msg(&format!("u{i}")));
+            msgs.push(assistant_msg(&format!("a{i}")));
+        }
+        assert_eq!(msgs.len(), 9);
+        let dropped = enforce_message_budget(&mut msgs, 5);
+        assert_eq!(dropped, 4);
+        assert_eq!(msgs.len(), 5);
+        // Prefix retained, first surviving turn starts at the u2 user message.
+        assert!(matches!(msgs[0], chat::MessageRequest::System(_)));
+        match &msgs[1] {
+            chat::MessageRequest::User(u) => match &u.content {
+                chat::UserContent::Text(t) => assert_eq!(t, "u2"),
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected user message at turn boundary"),
+        }
+    }
+
+    #[test]
+    fn message_budget_never_leaves_orphan_tool_message() {
+        // Turn: user, assistant(tool_call), tool. Cutting mid-turn would orphan
+        // the tool message; trimmer must cut only at user boundaries.
+        let mut msgs = vec![sys_msg("s")];
+        for i in 0..3 {
+            msgs.push(user_msg(&format!("u{i}")));
+            msgs.push(assistant_msg(&format!("a{i}")));
+            msgs.push(tool_msg(&format!("c{i}"), "out"));
+        }
+        // 1 + 3*3 = 10 messages. Limit 5.
+        let dropped = enforce_message_budget(&mut msgs, 5);
+        assert!(dropped > 0);
+        // First message after prefix must be a User (turn start), never a Tool.
+        assert!(matches!(msgs[0], chat::MessageRequest::System(_)));
+        assert!(
+            matches!(msgs[1], chat::MessageRequest::User(_)),
+            "first non-prefix message must be a user turn start, not an orphan"
+        );
+    }
+
+    #[test]
+    fn message_budget_keeps_last_turn_when_single_turn_overflows() {
+        // Prefix + one giant turn that alone exceeds the limit → keep it.
+        let mut msgs = vec![sys_msg("s"), user_msg("u0")];
+        for i in 0..5 {
+            msgs.push(assistant_msg(&format!("a{i}")));
+            msgs.push(tool_msg(&format!("c{i}"), "out"));
+        }
+        let len_before = msgs.len();
+        // Only one user turn exists, so nothing can be dropped without breaking it.
+        let dropped = enforce_message_budget(&mut msgs, 3);
+        assert_eq!(dropped, 0);
+        assert_eq!(msgs.len(), len_before);
     }
 
     #[test]

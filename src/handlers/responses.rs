@@ -82,6 +82,15 @@ pub async fn responses(
                 (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
             })?;
         cr.model = provider_model.clone();
+        let dropped =
+            crate::convert::enforce_message_budget(&mut cr.messages, provider.max_input_messages);
+        if dropped > 0 {
+            tracing::info!(
+                max_messages = provider.max_input_messages,
+                dropped_messages = dropped,
+                "Input exceeded history.max-input-messages — dropped oldest turns"
+            );
+        }
         if let Some(max_chars) = provider.max_input_chars {
             let shrunk = crate::convert::enforce_input_budget(&mut cr.messages, max_chars);
             if shrunk > 0 {

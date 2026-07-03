@@ -167,6 +167,7 @@ async fn spawn_proxy(chat_base_url: String) -> String {
             timeout: Duration::from_secs(10),
             rewrite: Default::default(),
             max_input_chars: None,
+            max_input_messages: 1000,
         },
     );
 
@@ -180,6 +181,7 @@ async fn spawn_proxy(chat_base_url: String) -> String {
         model_names: vec!["gpt-proxy-test".into()],
         models,
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     });
 
     let app = Router::new()

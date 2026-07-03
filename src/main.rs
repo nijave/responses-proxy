@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -99,6 +99,8 @@ async fn main() {
                 .zstd(true)
                 .deflate(true),
         )
+        // Innermost so the limit applies to the decompressed body the extractor buffers.
+        .layer(DefaultBodyLimit::max(state.config().max_body_bytes))
         .with_state(state.clone());
 
     tracing::info!("Listening on {}", listen);

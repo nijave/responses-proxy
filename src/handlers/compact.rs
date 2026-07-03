@@ -78,6 +78,22 @@ pub(crate) async fn build_compaction_output(
         name: None,
     }));
 
+    // Bound the summary request the same way the main request path is bounded:
+    // drop oldest turns to fit the message-count limit, then shrink old tool
+    // outputs to the char budget. The summary prompt is the trailing user turn,
+    // so it is always retained.
+    let dropped = crate::convert::enforce_message_budget(&mut messages, provider.max_input_messages);
+    if dropped > 0 {
+        tracing::info!(
+            max_messages = provider.max_input_messages,
+            dropped_messages = dropped,
+            "Compaction input exceeded history.max-input-messages — dropped oldest turns"
+        );
+    }
+    if let Some(max_chars) = provider.max_input_chars {
+        crate::convert::enforce_input_budget(&mut messages, max_chars);
+    }
+
     // Build upstream request (non-streaming, no tools, reasoning disabled)
     let upstream_req = chat::Request {
         model: provider.model.clone(),

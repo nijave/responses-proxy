@@ -19,6 +19,7 @@ fn test_state() -> responses_proxy::app::State {
         models: std::collections::HashMap::new(),
         model_names: vec![],
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     };
     responses_proxy::app::State::new(config)
 }
@@ -42,6 +43,7 @@ fn test_state_with_rewrite(
                 ..Default::default()
             },
             max_input_chars: None,
+            max_input_messages: 1000,
         },
     );
 
@@ -55,6 +57,7 @@ fn test_state_with_rewrite(
         models,
         model_names: vec!["gpt-5.5".into()],
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     };
     responses_proxy::app::State::new(config)
 }

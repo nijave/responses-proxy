@@ -35,6 +35,12 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub compact_encryption_key: String,
+    #[serde(default = "default_max_body_mb")]
+    pub max_body_mb: usize,
+}
+
+fn default_max_body_mb() -> usize {
+    100
 }
 
 fn default_log_level() -> String {
@@ -63,6 +69,7 @@ impl Default for ServerConfig {
             allowed_tool_types: default_allowed_tool_types(),
             log_level: default_log_level(),
             compact_encryption_key: String::new(),
+            max_body_mb: default_max_body_mb(),
         }
     }
 }
@@ -104,6 +111,12 @@ pub struct ModelEntry {
 pub struct HistoryConfig {
     #[serde(default)]
     pub max_input_chars: Option<usize>,
+    #[serde(default = "default_max_input_messages")]
+    pub max_input_messages: usize,
+}
+
+fn default_max_input_messages() -> usize {
+    1000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -536,6 +549,8 @@ pub struct ResolvedProvider {
     pub rewrite: RewriteProfile,
     /// Total character ceiling for the converted Chat request, if configured.
     pub max_input_chars: Option<usize>,
+    /// Maximum number of messages in the converted Chat request. 0 = unlimited.
+    pub max_input_messages: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +564,8 @@ pub struct ResolvedConfig {
     pub models: HashMap<String, ResolvedProvider>,
     pub model_names: Vec<String>,
     pub compact_encryption_key: String,
+    /// Maximum incoming request body size in bytes (after decompression).
+    pub max_body_bytes: usize,
 }
 
 impl ResolvedConfig {
@@ -602,6 +619,11 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
             .map(Duration::from_secs)
             .unwrap_or(default_timeout);
         let max_input_chars = entry.history.as_ref().and_then(|h| h.max_input_chars);
+        let max_input_messages = entry
+            .history
+            .as_ref()
+            .map(|h| h.max_input_messages)
+            .unwrap_or_else(default_max_input_messages);
 
         models.insert(
             logical_name.clone(),
@@ -612,6 +634,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 timeout,
                 rewrite,
                 max_input_chars,
+                max_input_messages,
             },
         );
         model_names.push(logical_name.clone());
@@ -633,6 +656,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         models,
         model_names,
         compact_encryption_key: config.server.compact_encryption_key,
+        max_body_bytes: config.server.max_body_mb * 1024 * 1024,
     })
 }
 
@@ -863,6 +887,44 @@ models:
         )
         .unwrap();
         assert_eq!(c.models["gpt-5"].model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_history_and_body_defaults() {
+        let c = parse(
+            "
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+",
+        )
+        .unwrap();
+        assert_eq!(c.models["gpt-4"].max_input_messages, 1000);
+        assert_eq!(c.max_body_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_history_and_body_overrides() {
+        let c = parse(
+            "
+server:
+  max-body-mb: 25
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+    history:
+      max-input-messages: 50
+      max-input-chars: 200000
+",
+        )
+        .unwrap();
+        assert_eq!(c.models["gpt-4"].max_input_messages, 50);
+        assert_eq!(c.models["gpt-4"].max_input_chars, Some(200000));
+        assert_eq!(c.max_body_bytes, 25 * 1024 * 1024);
     }
 
     #[test]
