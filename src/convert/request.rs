@@ -40,6 +40,8 @@ pub async fn responses_to_chat(
                 crate::types::ReasoningEffort::Medium => "medium",
                 crate::types::ReasoningEffort::High => "high",
                 crate::types::ReasoningEffort::Xhigh => "xhigh",
+                crate::types::ReasoningEffort::Max => "max",
+                crate::types::ReasoningEffort::Ultra => "ultra",
             }
             .into()
         })
@@ -286,7 +288,10 @@ pub async fn responses_to_chat(
         "low" => crate::types::ReasoningEffort::Low,
         "medium" => crate::types::ReasoningEffort::Medium,
         "high" => crate::types::ReasoningEffort::High,
-        "max" | "xhigh" => crate::types::ReasoningEffort::Xhigh,
+        "xhigh" => crate::types::ReasoningEffort::Xhigh,
+        // gpt-5.6-class tiers above xhigh — passed through verbatim.
+        "max" => crate::types::ReasoningEffort::Max,
+        "ultra" => crate::types::ReasoningEffort::Ultra,
         _ => crate::types::ReasoningEffort::None,
     });
 

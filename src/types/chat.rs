@@ -122,7 +122,8 @@ pub struct Request {
     pub prompt_cache_retention: Option<super::PromptCacheRetention>,
 
     /// Reasoning effort for o-series / gpt-5 models.
-    /// Allowed: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`.
+    /// Allowed: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+    /// `"max"`, `"ultra"` (the last two are gpt-5.6-class tiers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<super::ReasoningEffort>,
 

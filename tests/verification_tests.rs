@@ -212,6 +212,9 @@ async fn s3_reasoning_effort_all_levels() {
         ("medium", true, Some("medium")),
         ("high", true, Some("high")),
         ("xhigh", true, Some("xhigh")),
+        // gpt-5.6-class tiers above xhigh — passed through verbatim.
+        ("max", true, Some("max")),
+        ("ultra", true, Some("ultra")),
     ];
 
     for (effort, expect_think, expect_re) in cases {
