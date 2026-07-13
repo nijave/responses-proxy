@@ -96,7 +96,6 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
 
     let model = req.model.clone();
     let generate = req.generate;
-    let store = req.store;
 
     let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -178,9 +177,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             }
         }
 
-        if store {
-            state.store().put(rid, full_input_messages).await;
-        }
+        state.store().put(rid, full_input_messages).await;
         return;
     }
 
@@ -314,9 +311,14 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
     // Clean up cancel token (run_stream already handled the actual cancellation check)
     state.store().unregister_cancel_token(&rid).await;
 
-    // Persist accumulated history (only when the client opted into server-side
-    // state; Codex runs store:false and replays history itself).
-    if !cancelled && store {
+    // Persist accumulated history so `previous_response_id` chains resolve.
+    // Codex (store:false) replays full history on new user turns but sends
+    // tool-result *deltas* referencing previous_response_id after a
+    // function_call — without the stored assistant tool_calls message those
+    // deltas would orphan the tool result and the upstream would 400. The
+    // client `store` flag governs client-side GET retrieval, not this internal
+    // chaining, so persist regardless of it.
+    if !cancelled {
         // Append assistant response to input messages and store
         let assistant_msg: MessageRequest = response_msg.into();
         let has_reasoning =
@@ -517,14 +519,11 @@ async fn handle_compaction_trigger(
     };
 
     // Compute persisted summary before `resp` is moved into the Completed event.
-    let store_messages = if req.store {
-        Some(crate::handlers::compaction_output_to_chat_messages(
-            &resp.output,
-            state,
-        ))
-    } else {
-        None
-    };
+    // Persist regardless of req.store so a later previous_response_id resolves.
+    let store_messages = Some(crate::handlers::compaction_output_to_chat_messages(
+        &resp.output,
+        state,
+    ));
 
     let lifecycle = Response {
         status: ResponseStatus::InProgress,
