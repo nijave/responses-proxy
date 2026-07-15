@@ -115,6 +115,15 @@ pub async fn responses_to_chat(
         }));
     }
 
+    // Codex gpt-5.6 code-mode tool definitions arrive inside `additional_tools`
+    // input items; collect their raw entries here and flatten them into Chat
+    // function tools further down.
+    let mut additional_tool_defs: Vec<serde_json::Value> = Vec::new();
+
+    // Names Codex declared as custom (code-mode) — used to keep replayed history
+    // calls consistent with the `{ input }` function schema we present.
+    let custom_names = custom_tool_names(&req.input);
+
     // Walk input items
     let items: Vec<InputItem> = req.input;
     if !items.is_empty() {
@@ -232,11 +241,20 @@ pub async fn responses_to_chat(
                     }
                 }
                 InputItem::CustomToolCall(ctc) => {
+                    // We present code-mode custom tools to the model as functions
+                    // taking `{ input: string }`, so the replayed assistant call
+                    // must use that JSON shape (raw freeform is not valid JSON
+                    // arguments). Other custom tools keep their raw input.
+                    let arguments = if custom_names.contains(&ctc.name) {
+                        serde_json::json!({ "input": ctc.input }).to_string()
+                    } else {
+                        ctc.input.clone()
+                    };
                     pending_tool_calls.push(chat::ToolCallRequest::Function {
                         id: ctc.call_id.clone(),
                         function: chat::ToolCallFunction {
                             name: ctc.name.clone(),
-                            arguments: ctc.input.clone(),
+                            arguments,
                         },
                     });
                 }
@@ -262,6 +280,11 @@ pub async fn responses_to_chat(
                 | InputItem::ImageGenerationCall(_)
                 | InputItem::ToolSearchCall(_)
                 | InputItem::ToolSearchOutput(_) => {}
+                // Codex gpt-5.6 code-mode tool definitions — collect for
+                // flattening into Chat function tools (not a conversation item).
+                InputItem::AdditionalTools(at) => {
+                    additional_tool_defs.extend(at.tools);
+                }
                 other => {
                     tracing::warn!(
                         item = %unconvertible_item_label(&other),
@@ -331,25 +354,18 @@ pub async fn responses_to_chat(
         }
     }
 
-    Ok(chat::Request {
-        model: req.model,
-        messages,
-        temperature: Some(req.temperature),
-        top_p: Some(req.top_p),
-        max_completion_tokens: req.max_output_tokens,
-        stream: Some(req.stream),
-        stream_options,
-        // Pass through request metadata
-        prompt_cache_key: req.prompt_cache_key.clone(),
-        prompt_cache_retention: req.prompt_cache_retention.clone(),
-        safety_identifier: req.safety_identifier.clone(),
-        service_tier: req.service_tier.clone(),
-        verbosity,
-        parallel_tool_calls: Some(req.parallel_tool_calls),
-        store: Some(req.store),
-        tools: req.tools.and_then(|tools| {
+    // Build the Chat tool list. Top-level `req.tools` keeps its existing
+    // conversion untouched (no behavior change for gpt-5.5 and earlier). Codex
+    // gpt-5.6 instead ships tool definitions inside `additional_tools` input
+    // items using the code-mode `custom`/`namespace` protocol, which Chat
+    // Completions rejects — those are flattened into plain `function` tools and
+    // appended. When there are no `additional_tools`, this is a no-op.
+    let mut chat_tools: Vec<chat::ToolRequest> = req
+        .tools
+        .as_ref()
+        .map(|tools| {
             let allow = &state.config().allowed_tool_types;
-            let converted = tools
+            tools
                 .iter()
                 .filter_map(|t| match t {
                     crate::types::tool::ToolRequest::Function(f) => {
@@ -393,13 +409,42 @@ pub async fn responses_to_chat(
                     }
                     _ => None,
                 })
-                .collect::<Vec<_>>();
-            if converted.is_empty() {
-                None
-            } else {
-                Some(converted)
-            }
-        }),
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for v in &additional_tool_defs {
+        chat_tools.extend(additional_tools_to_chat_functions(v));
+    }
+    if !additional_tool_defs.is_empty() {
+        tracing::debug!(
+            hoisted = chat_tools.len(),
+            names = ?chat_tools.iter().map(chat_tool_name).collect::<Vec<_>>(),
+            "hoisted Codex additional_tools into chat function tools"
+        );
+    }
+    let tools = if chat_tools.is_empty() {
+        None
+    } else {
+        Some(chat_tools)
+    };
+
+    Ok(chat::Request {
+        model: req.model,
+        messages,
+        temperature: Some(req.temperature),
+        top_p: Some(req.top_p),
+        max_completion_tokens: req.max_output_tokens,
+        stream: Some(req.stream),
+        stream_options,
+        // Pass through request metadata
+        prompt_cache_key: req.prompt_cache_key.clone(),
+        prompt_cache_retention: req.prompt_cache_retention.clone(),
+        safety_identifier: req.safety_identifier.clone(),
+        service_tier: req.service_tier.clone(),
+        verbosity,
+        parallel_tool_calls: Some(req.parallel_tool_calls),
+        store: Some(req.store),
+        tools,
         tool_choice: req.tool_choice.and_then(convert_tool_choice),
         response_format,
         stop: req.stop,
@@ -408,6 +453,133 @@ pub async fn responses_to_chat(
         reasoning_effort,
         ..Default::default()
     })
+}
+
+/// Names of tools Codex declared as `custom` (code-mode `exec`, `namespace`
+/// custom members). Their calls must be mapped back to the `custom_tool_call`
+/// shape Codex expects on the response side, and their replayed history calls
+/// wrapped to match the `{ input }` function schema we present. Mirrors the
+/// naming used by [`additional_tools_to_chat_functions`].
+pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<String> {
+    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
+    let mut names = std::collections::HashSet::new();
+    for item in input {
+        let InputItem::AdditionalTools(at) = item else {
+            continue;
+        };
+        for v in &at.tools {
+            let Ok(parsed) = serde_json::from_value::<Rt>(v.clone()) else {
+                continue;
+            };
+            match parsed {
+                Rt::Custom(c) => {
+                    if let Some(n) = c.name {
+                        names.insert(n);
+                    }
+                }
+                Rt::Namespace(ns) => {
+                    for m in ns.tools.unwrap_or_default() {
+                        if let NamespaceToolItem::Custom(nc) = m {
+                            names.insert(nc.name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
+/// Flatten one Codex `additional_tools` entry (code-mode
+/// `custom`/`namespace`/`function`) into Chat Completions `function` tools.
+/// Unrecognized entries are skipped. Tool names are preserved verbatim so the
+/// `function_call` the model emits routes back to the matching Codex tool.
+fn additional_tools_to_chat_functions(v: &serde_json::Value) -> Vec<chat::ToolRequest> {
+    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
+    let parsed: Rt = match serde_json::from_value(v.clone()) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(error = %e, "additional_tools: unrecognized tool entry, skipping");
+            return Vec::new();
+        }
+    };
+    match parsed {
+        Rt::Function(f) => vec![function_tool(
+            f.name.unwrap_or_default(),
+            f.description,
+            f.parameters,
+            f.strict,
+        )],
+        Rt::Namespace(ns) => ns
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| match item {
+                NamespaceToolItem::Function(nf) => {
+                    function_tool(nf.name, nf.description, nf.parameters, nf.strict)
+                }
+                NamespaceToolItem::Custom(nc) => custom_as_function(nc.name, nc.description),
+            })
+            .collect(),
+        Rt::Custom(c) => vec![custom_as_function(c.name.unwrap_or_default(), c.description)],
+        // e.g. `mcp` (remote server reference — no per-tool schema to flatten),
+        // `tool_search`, `web_search`. Codex 5.6 delivers usable MCP tools as a
+        // `namespace` (handled above); anything landing here has no Chat
+        // Completions function equivalent.
+        _ => {
+            tracing::debug!(
+                tool_type = %v.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
+                "additional_tools: tool type has no Chat function equivalent — skipping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn function_tool(
+    name: String,
+    description: Option<String>,
+    parameters: Option<serde_json::Value>,
+    strict: Option<bool>,
+) -> chat::ToolRequest {
+    chat::ToolRequest::Function {
+        function: chat::FunctionTool {
+            name,
+            description,
+            parameters,
+            strict,
+        },
+    }
+}
+
+/// Represent a code-mode `custom` tool (freeform text / code) as a Chat
+/// `function` tool taking a single freeform string argument — Chat Completions
+/// has no freeform/grammar tool type.
+fn custom_as_function(name: String, description: Option<String>) -> chat::ToolRequest {
+    function_tool(
+        name,
+        description,
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Raw tool input (freeform text or code)."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })),
+        Some(false),
+    )
+}
+
+fn chat_tool_name(t: &chat::ToolRequest) -> String {
+    match t {
+        chat::ToolRequest::Function { function } => function.name.clone(),
+        chat::ToolRequest::Custom { custom } => custom.name.clone(),
+    }
 }
 
 fn convert_tool_choice(tc: crate::types::tool::ToolChoice) -> Option<chat::ToolChoice> {

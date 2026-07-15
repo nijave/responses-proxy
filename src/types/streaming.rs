@@ -24,6 +24,7 @@ use super::event;
 pub use super::event::StreamEvent;
 use super::item::{self, OutputContentBlock, OutputItem, ReasoningTextPart};
 use super::responses::{Response, ResponseStatus};
+use std::collections::HashSet;
 
 // ── Streaming accumulator ────────────────────────────────────────────────
 
@@ -54,6 +55,10 @@ pub struct StreamState {
     /// If set, reasoning content is encrypted into `encrypted_content`
     /// instead of being stored as plain `content`.
     pub compact_key: Option<[u8; 32]>,
+    /// Tool names Codex declared as `custom` (code-mode). Upstream returns them
+    /// as `function` calls; for these names the client-facing events are emitted
+    /// as `custom_tool_call` instead (see [`emit_tool_call_deltas`]).
+    pub custom_tool_names: HashSet<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +69,8 @@ pub struct ToolCallAccumulator {
     pub index: i64,
     pub fc_id: String,
     pub output_index: i64,
+    /// True when this tool name is in [`StreamState::custom_tool_names`].
+    pub is_custom: bool,
 }
 
 impl StreamState {
@@ -462,43 +469,113 @@ fn close_reasoning_item(state: &mut StreamState) -> Vec<StreamEvent> {
     events
 }
 
+/// Extract the freeform `input` from the `{ "input": "..." }` wrapper we present
+/// custom (code-mode) tools with. Falls back to the raw string if it is not the
+/// expected JSON shape.
+pub fn unwrap_custom_input(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent> {
-    // Capture seq before borrowing tool_calls (avoids borrow conflict)
-    let seq1 = next_seq(state);
-    let seq2 = next_seq(state);
-
-    let tc = &state.tool_calls[idx];
-    let mut events = Vec::new();
-
-    let fc_id = if tc.fc_id.is_empty() {
-        format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
-    } else {
-        tc.fc_id.clone()
+    // Copy the fields we need in a scoped borrow so the mutable `next_seq` /
+    // `completed_items` calls below don't conflict with the tool_calls borrow.
+    let (id, name, arguments, output_index, fc_id_raw, is_custom) = {
+        let tc = &state.tool_calls[idx];
+        (
+            tc.id.clone(),
+            tc.name.clone(),
+            tc.arguments.clone(),
+            tc.output_index,
+            tc.fc_id.clone(),
+            tc.is_custom,
+        )
     };
+    let mut events = Vec::new();
+    let item_id = if fc_id_raw.is_empty() {
+        let prefix = if is_custom { "ctc" } else { "fc" };
+        format!(
+            "{}_{}",
+            prefix,
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        )
+    } else {
+        fc_id_raw
+    };
+
+    if is_custom {
+        // Codex expects a custom_tool_call for these. Per-chunk deltas were
+        // suppressed (they carried the JSON `{ input }` wrapper), so emit the
+        // unwrapped freeform input once as delta + done.
+        let input = unwrap_custom_input(&arguments);
+        events.push(StreamEvent::CustomToolCallInputDelta(
+            event::CustomToolCallInputDelta {
+                delta: input.clone(),
+                item_id: item_id.clone(),
+                output_index,
+                sequence_number: next_seq(state),
+            },
+        ));
+        events.push(StreamEvent::CustomToolCallInputDone(
+            event::CustomToolCallInputDone {
+                input: input.clone(),
+                item_id: item_id.clone(),
+                output_index,
+                sequence_number: next_seq(state),
+            },
+        ));
+        events.push(StreamEvent::OutputItemDone(event::OutputItemDone {
+            output_index,
+            item: OutputItem::CustomToolCall(item::CustomToolCall {
+                call_id: id.clone(),
+                input,
+                name: name.clone(),
+                id: Some(item_id),
+                namespace: None,
+            }),
+            sequence_number: next_seq(state),
+        }));
+        // Keep the function-shaped call in completed_items so the stored/replayed
+        // assistant message stays function-typed (the upstream only accepts
+        // function tools).
+        state
+            .completed_items
+            .push(OutputItem::FunctionCall(item::FunctionCall {
+                call_id: id,
+                name,
+                arguments,
+                id: None,
+                namespace: None,
+                status: Some("completed".into()),
+            }));
+        return events;
+    }
 
     // function_call_arguments.done
     events.push(StreamEvent::FunctionCallArgumentsDone(
         event::FunctionCallArgumentsDone {
-            arguments: tc.arguments.clone(),
-            item_id: fc_id.clone(),
-            output_index: tc.output_index,
-            sequence_number: seq1,
+            arguments: arguments.clone(),
+            item_id: item_id.clone(),
+            output_index,
+            sequence_number: next_seq(state),
         },
     ));
 
     // output_item.done
     let fc_item = OutputItem::FunctionCall(item::FunctionCall {
-        call_id: tc.id.clone(),
-        name: tc.name.clone(),
-        arguments: tc.arguments.clone(),
-        id: Some(fc_id),
+        call_id: id,
+        name,
+        arguments,
+        id: Some(item_id),
         namespace: None,
         status: Some("completed".into()),
     });
     events.push(StreamEvent::OutputItemDone(event::OutputItemDone {
-        output_index: tc.output_index,
+        output_index,
         item: fc_item.clone(),
-        sequence_number: seq2,
+        sequence_number: next_seq(state),
     }));
     state.completed_items.push(fc_item);
 
@@ -889,8 +966,21 @@ fn emit_tool_call_deltas(
             state.tool_calls[idx].output_index
         };
 
+        // Determine custom-ness from the (possibly newly arriving) name before
+        // taking the mutable slot borrow. Codex declared these as custom tools;
+        // upstream returns them as function calls, so the client-facing item is
+        // emitted as `custom_tool_call`.
+        let is_custom = state.tool_calls[idx].is_custom
+            || tc
+                .function
+                .as_ref()
+                .and_then(|f| f.name.as_deref())
+                .map(|n| state.custom_tool_names.contains(n))
+                .unwrap_or(false);
+
         // Now borrow the slot
         let slot = &mut state.tool_calls[idx];
+        slot.is_custom = is_custom;
 
         // Capture id / name on first appearance
         if let Some(ref id) = tc.id {
@@ -908,18 +998,33 @@ fn emit_tool_call_deltas(
         // Emit output_item.added on first appearance
         if first_time {
             slot.output_index = oi;
-            let fc_id = format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-            slot.fc_id.clone_from(&fc_id);
-            events.push(StreamEvent::OutputItemAdded(event::OutputItemAdded {
-                output_index: oi,
-                item: OutputItem::FunctionCall(item::FunctionCall {
+            let item_id = format!(
+                "{}_{}",
+                if is_custom { "ctc" } else { "fc" },
+                uuid::Uuid::new_v4().to_string().replace('-', "")
+            );
+            slot.fc_id.clone_from(&item_id);
+            let item = if is_custom {
+                OutputItem::CustomToolCall(item::CustomToolCall {
+                    call_id: slot.id.clone(),
+                    input: String::new(),
+                    name: slot.name.clone(),
+                    id: Some(item_id),
+                    namespace: None,
+                })
+            } else {
+                OutputItem::FunctionCall(item::FunctionCall {
                     call_id: slot.id.clone(),
                     name: slot.name.clone(),
                     arguments: String::new(),
-                    id: Some(fc_id),
+                    id: Some(item_id),
                     namespace: None,
                     status: Some("in_progress".into()),
-                }),
+                })
+            };
+            events.push(StreamEvent::OutputItemAdded(event::OutputItemAdded {
+                output_index: oi,
+                item,
                 sequence_number: {
                     let s = local_seq;
                     local_seq += 1;
@@ -928,8 +1033,11 @@ fn emit_tool_call_deltas(
             }));
         }
 
-        // Emit arguments delta
-        if let Some(ref func) = tc.function
+        // Emit arguments delta. For custom tools we suppress per-chunk deltas
+        // (the arguments are the JSON `{ input }` wrapper, not the freeform
+        // input); the unwrapped input is emitted once at close.
+        if !is_custom
+            && let Some(ref func) = tc.function
             && let Some(ref args) = func.arguments
         {
             events.push(StreamEvent::FunctionCallArgumentsDelta(

@@ -911,12 +911,30 @@ pub struct WebSearchCall {
     pub status: String,
 }
 
+/// `additional_tools` input item — Codex (gpt-5.6+) delivers tool definitions
+/// mid-conversation as an input item (role `developer`) instead of the
+/// top-level `tools` array. Its entries use the code-mode protocol
+/// (`custom`/`namespace`), which Chat Completions does not accept, so the
+/// converter flattens them into plain `function` tools.
+///
+/// `tools` is kept as raw `Value` on purpose: an unrecognized tool type must
+/// not fail the whole request parse — each entry is decoded individually in
+/// the converter and skipped if unknown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdditionalTools {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<serde_json::Value>,
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ── Tagged Enum: InputItem ──────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Input item union type — elements of the `input` array in API requests.
-/// Dispatched by `type` field.  27 variants + Unknown catch-all.
+/// Dispatched by `type` field.  28 variants + Unknown catch-all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputItem {
@@ -948,6 +966,7 @@ pub enum InputItem {
     ToolSearchCall(ToolSearchCall),
     ToolSearchOutput(ToolSearchOutput),
     ItemReference(ItemReference),
+    AdditionalTools(AdditionalTools),
     #[serde(untagged)]
     Unknown(serde_json::Value),
 }

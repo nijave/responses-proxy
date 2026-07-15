@@ -100,6 +100,11 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
     let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
 
+    // gpt-5.6 code-mode: names Codex declared as custom tools (computed before
+    // `req` is moved), so streamed function calls can be re-emitted as
+    // custom_tool_call. Empty for models below 5.6 → no behavior change.
+    let custom_names = crate::convert::custom_tool_names(&req.input);
+
     // Convert to Chat API (responses_to_chat handles history + instructions)
     let mut chat_req = match responses_to_chat(req, state).await {
         Ok(cr) => cr,
@@ -301,6 +306,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         responses_out: &provider.rewrite.responses_out,
         now,
         compact_key: state.compact_key(),
+        custom_tool_names: custom_names,
     };
     let (response_msg, cancelled, stream_events) =
         run_stream(socket, stream_resp, stream_context, cancel_rx).await;
@@ -344,6 +350,7 @@ struct WsStreamContext<'a> {
     responses_out: &'a crate::config::RewriteConfig,
     now: i64,
     compact_key: Option<&'a [u8; 32]>,
+    custom_tool_names: std::collections::HashSet<String>,
 }
 
 async fn run_stream(
@@ -361,6 +368,7 @@ async fn run_stream(
     ss.has_started = true;
     ss.created = context.now;
     ss.compact_key = context.compact_key.copied();
+    ss.custom_tool_names = context.custom_tool_names;
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
     let mut collected_events: Vec<StreamEvent> = Vec::new();

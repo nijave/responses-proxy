@@ -221,11 +221,19 @@ fn send_chat_request(
     provider: &crate::config::ResolvedProvider,
 ) -> Result<reqwest::RequestBuilder, String> {
     if provider.rewrite.chat_out.is_empty() {
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(chat_req).unwrap_or_default()
+        );
         return Ok(request.json(chat_req));
     }
 
     let mut body = serde_json::to_value(chat_req).map_err(|e| e.to_string())?;
     crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out)?;
+    tracing::debug!(
+        "chat request: {}",
+        serde_json::to_string(&body).unwrap_or_default()
+    );
     Ok(request.json(&body))
 }
 
@@ -276,6 +284,11 @@ async fn execute_upstream_request(
     };
 
     let mut resp = chat_to_responses(chat_resp, model, state.compact_key());
+
+    // gpt-5.6 code-mode: map function_call output items back to the
+    // custom_tool_call shape Codex expects (no-op for models below 5.6).
+    let custom_names = crate::convert::custom_tool_names(&original_req.input);
+    crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
 
     apply_include_filter(&mut resp, &original_req.include);
 
@@ -389,9 +402,12 @@ async fn handle_streaming(
     // Register cancellation token so POST /v1/responses/{id}/cancel can stop this stream
     let cancel_rx = store.register_cancel_token(&rid).await;
 
+    let custom_names = crate::convert::custom_tool_names(&original_req.input);
+
     tokio::spawn(async move {
         let mut buf = String::new();
         let mut ss = StreamState::new(rid.clone(), mid.clone(), model.clone());
+        ss.custom_tool_names = custom_names;
         let seq: u64 = 0;
         let mut collected_events: Vec<StreamEvent> = Vec::new();
         let mut cancel_rx = cancel_rx;
@@ -1127,6 +1143,7 @@ mod tests {
                 fc_id: "fc_1".into(),
                 index: 0,
                 output_index: 0,
+                ..Default::default()
             },
             crate::types::streaming::ToolCallAccumulator {
                 id: String::new(), // skipped — empty id
@@ -1135,6 +1152,7 @@ mod tests {
                 fc_id: String::new(),
                 index: 1,
                 output_index: 1,
+                ..Default::default()
             },
         ];
 
