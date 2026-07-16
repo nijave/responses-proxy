@@ -104,6 +104,10 @@ pub async fn responses(
         let input_msgs = cr.messages.clone();
         (cr, input_msgs)
     };
+    // Cache the code-mode tool registry so tool-result continuations (which
+    // reference this response via `previous_response_id` but omit
+    // `additional_tools`) can restore it. Empty for models below 5.6 → no-op.
+    let response_tools = chat_req.tools.clone().unwrap_or_default();
     let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
     tracing::info!(
         model = %model,
@@ -179,13 +183,29 @@ pub async fn responses(
     }
 
     if is_stream {
-        handle_streaming(&state, &provider, chat_req, model, req, full_input_messages)
-            .await
-            .map(|s| s.into_response())
+        handle_streaming(
+            &state,
+            &provider,
+            chat_req,
+            model,
+            req,
+            full_input_messages,
+            response_tools,
+        )
+        .await
+        .map(|s| s.into_response())
     } else {
-        handle_non_streaming(&state, &provider, chat_req, model, req, full_input_messages)
-            .await
-            .map(|j| j.into_response())
+        handle_non_streaming(
+            &state,
+            &provider,
+            chat_req,
+            model,
+            req,
+            full_input_messages,
+            response_tools,
+        )
+        .await
+        .map(|j| j.into_response())
     }
 }
 
@@ -304,6 +324,7 @@ async fn handle_non_streaming(
     model: String,
     original_req: ResponsesRequest,
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
+    response_tools: Vec<crate::types::chat::ToolRequest>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let mut resp = execute_upstream_request(state, provider, chat_req, model, &original_req)
         .await
@@ -322,6 +343,10 @@ async fn handle_non_streaming(
         let mut store_messages = full_input_messages;
         let output_inputs = output_to_input_items(&resp.output);
         store_messages.extend(items_to_chat_messages(&output_inputs, state));
+        state
+            .store()
+            .put_tools(resp.id.clone(), response_tools)
+            .await;
         state.store().put(resp.id.clone(), store_messages).await;
     }
 
@@ -358,6 +383,7 @@ async fn handle_streaming(
     model: String,
     original_req: ResponsesRequest,
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
+    response_tools: Vec<crate::types::chat::ToolRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -516,6 +542,9 @@ async fn handle_streaming(
                                         let mut msgs = full_input_messages.clone();
                                         let out = output_to_input_items(&final_resp.output);
                                         msgs.extend(items_to_chat_messages(&out, &bg_state));
+                                        store
+                                            .put_tools(rid.clone(), response_tools.clone())
+                                            .await;
                                         store.put(rid.clone(), msgs).await;
                                     }
                                     store.unregister_cancel_token(&rid).await;
@@ -585,6 +614,9 @@ async fn handle_streaming(
                 "SSE: persisting response"
             );
             msgs.extend(chat_msgs);
+            store
+                .put_tools(rid.clone(), response_tools.clone())
+                .await;
             store.put(rid.clone(), msgs).await;
         }
         store.unregister_cancel_token(&rid).await;

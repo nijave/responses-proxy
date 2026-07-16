@@ -439,6 +439,72 @@ async fn multi_agent_hosted_action_dropped_outside_collaboration_namespace() {
     assert_eq!(names, vec!["keep_me"]);
 }
 
+#[tokio::test]
+async fn code_mode_tools_restored_on_continuation_turn() {
+    // Codex delivers `additional_tools` only on a new user turn; a tool-result
+    // continuation references `previous_response_id` and omits them. The proxy
+    // caches the derived registry under the response id and restores it on the
+    // continuation so the model isn't left with an empty tool set (which made it
+    // stall after a single call).
+    let state = test_state();
+
+    // Turn 1: additional_tools present → tools built and cached under a rid.
+    let turn1: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "custom", "name": "exec", "description": "Run JS"},
+                {"type": "function", "name": "wait",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]}
+        ]
+    }))
+    .unwrap();
+    let chat1 = responses_to_chat(turn1, &state).await.unwrap();
+    let tools1 = chat1.tools.clone().expect("turn 1 has tools");
+    assert_eq!(tools1.len(), 2);
+    state
+        .store()
+        .put_tools("resp_turn1".to_string(), tools1)
+        .await;
+
+    // Turn 2: continuation — no additional_tools, references the prior response.
+    let turn2: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_turn1",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let chat2 = responses_to_chat(turn2, &state).await.unwrap();
+    let j = serde_json::to_value(&chat2).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("continuation restored tools")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["exec", "wait"]);
+}
+
+#[tokio::test]
+async fn continuation_without_cached_tools_stays_toolless() {
+    // No regression: a continuation that never had code-mode tools (e.g. models
+    // below 5.6) resolves to no tools rather than inventing any.
+    let state = test_state();
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_unknown",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let chat = responses_to_chat(req, &state).await.unwrap();
+    assert!(chat.tools.is_none());
+}
+
 // ── Codex gpt-5.6 code-mode: custom ↔ function round-trip ────────────
 #[tokio::test]
 async fn custom_tool_names_extracted_from_additional_tools() {

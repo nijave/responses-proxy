@@ -422,6 +422,24 @@ pub async fn responses_to_chat(
             "hoisted Codex additional_tools into chat function tools"
         );
     }
+    // Codex delivers its gpt-5.6 code-mode `additional_tools` only on a new user
+    // turn. A tool-result continuation references `previous_response_id` and
+    // omits them, which would leave the model with an empty tool registry — it
+    // then reports "no tools available" and stalls after a single call. Restore
+    // the registry cached under the previous response so the conversation keeps
+    // its tools. Only fires when the current turn brought no tools of its own,
+    // so non-code-mode turns (which re-send top-level `tools`) are untouched.
+    if chat_tools.is_empty()
+        && let Some(ref prev_id) = req.previous_response_id
+        && let Some(cached) = state.store().get_tools(prev_id).await
+    {
+        tracing::debug!(
+            restored = cached.len(),
+            prev_id = %prev_id,
+            "restored code-mode tool registry from previous response"
+        );
+        chat_tools = cached;
+    }
     let tools = if chat_tools.is_empty() {
         None
     } else {

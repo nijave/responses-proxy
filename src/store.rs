@@ -2,7 +2,7 @@
 //!
 //! Each entry is persisted as a JSONL file under `messages/{id}.jsonl`.
 
-use crate::types::chat::MessageRequest;
+use crate::types::chat::{MessageRequest, ToolRequest};
 use rustc_hash::FxHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,12 +20,24 @@ struct StoredMessages {
     created_at: Instant,
 }
 
+#[derive(Clone)]
+struct StoredTools {
+    tools: Vec<ToolRequest>,
+    created_at: Instant,
+}
+
 // ── Store ────────────────────────────────────────────────────────────────────
 
 /// Thread-safe, in-memory message store with TTL cleanup and disk persistence.
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<RwLock<HashMap<String, StoredMessages>>>,
+    /// gpt-5.6 code-mode tool registry keyed by response ID. Codex delivers its
+    /// `additional_tools` only on a new user turn; tool-result continuations
+    /// reference `previous_response_id` and omit them, so the registry is cached
+    /// here and restored on those continuations. In-memory only (TTL-bounded) —
+    /// a new user turn always re-supplies the tools.
+    tools: Arc<RwLock<HashMap<String, StoredTools>>>,
     ttl: Duration,
     dir: Option<PathBuf>,
     cancel_tokens: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
@@ -35,6 +47,7 @@ impl Store {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::default())),
+            tools: Arc::new(RwLock::new(HashMap::default())),
             ttl: DEFAULT_TTL,
             dir: None,
             cancel_tokens: Arc::new(RwLock::new(HashMap::default())),
@@ -45,6 +58,7 @@ impl Store {
         std::fs::create_dir_all(dir.join("messages")).ok();
         Self {
             inner: Arc::new(RwLock::new(HashMap::default())),
+            tools: Arc::new(RwLock::new(HashMap::default())),
             ttl: DEFAULT_TTL,
             dir: Some(dir),
             cancel_tokens: Arc::new(RwLock::new(HashMap::default())),
@@ -83,6 +97,34 @@ impl Store {
         }
     }
 
+    /// Cache the gpt-5.6 code-mode tool registry for a response ID. No-op for an
+    /// empty list so non-code-mode turns don't allocate entries.
+    pub async fn put_tools(&self, id: String, tools: Vec<ToolRequest>) {
+        if tools.is_empty() {
+            return;
+        }
+        self.tools.write().await.insert(
+            id,
+            StoredTools {
+                tools,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Retrieve the cached tool registry by ID. Returns None if not found or
+    /// expired.
+    pub async fn get_tools(&self, id: &str) -> Option<Vec<ToolRequest>> {
+        let g = self.tools.read().await;
+        let entry = g.get(id)?;
+        if entry.created_at.elapsed() <= self.ttl {
+            return Some(entry.tools.clone());
+        }
+        drop(g);
+        self.tools.write().await.remove(id);
+        None
+    }
+
     /// Retrieve stored messages by ID. Returns None if not found or expired.
     pub async fn get(&self, id: &str) -> Option<Vec<MessageRequest>> {
         {
@@ -116,14 +158,28 @@ impl Store {
                 .map(|(k, _)| k.clone())
                 .collect()
         };
-        if expired.is_empty() {
-            return;
-        }
         for k in &expired {
             self.inner.write().await.remove(k);
             self.delete_disk_files(k);
         }
-        tracing::info!(count = expired.len(), "Swept expired entries from store");
+        {
+            let expired_tools: Vec<String> = {
+                let g = self.tools.read().await;
+                g.iter()
+                    .filter(|(_, v)| v.created_at.elapsed() > self.ttl)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
+            if !expired_tools.is_empty() {
+                let mut g = self.tools.write().await;
+                for k in &expired_tools {
+                    g.remove(k);
+                }
+            }
+        }
+        if !expired.is_empty() {
+            tracing::info!(count = expired.len(), "Swept expired entries from store");
+        }
     }
 
     pub fn start_sweep_task(&self) {

@@ -140,6 +140,11 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         }
     }
     let mut full_input_messages = chat_req.messages.clone();
+    // Cache the code-mode tool registry so tool-result continuations (which
+    // reference this response via `previous_response_id` but omit
+    // `additional_tools`) can restore it instead of reaching the model with no
+    // tools. Empty for models below 5.6 → no-op.
+    let response_tools = chat_req.tools.clone().unwrap_or_default();
 
     // If generate=false, just echo lifecycle events without calling upstream
     if !generate {
@@ -182,6 +187,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             }
         }
 
+        state.store().put_tools(rid.clone(), response_tools).await;
         state.store().put(rid, full_input_messages).await;
         return;
     }
@@ -336,6 +342,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             "WS: storing history"
         );
         full_input_messages.push(assistant_msg);
+        state.store().put_tools(rid.clone(), response_tools).await;
         state.store().put(rid, full_input_messages).await;
     }
 }
