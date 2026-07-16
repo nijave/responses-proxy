@@ -339,6 +339,106 @@ async fn mcp_namespace_tools_flattened_to_chat_functions() {
     );
 }
 
+#[tokio::test]
+async fn multi_agent_collaboration_tools_dropped() {
+    // gpt-5.6 multi-agent mode delivers the hosted collaboration actions
+    // (spawn_agent, …) inside a `collaboration` namespace. They execute in
+    // OpenAI's hosted Responses runtime, not the client, so a Chat Completions
+    // upstream cannot fulfil them — advertising them lures the model into
+    // `spawn_agent` calls the client rejects as `unsupported call`. They must be
+    // dropped while the client-executable tools (exec/wait/request_user_input)
+    // are kept, so the model falls back to plain single-agent code-mode.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JS"},
+                    {"type": "function", "name": "wait", "description": "wait",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "function", "name": "request_user_input",
+                     "description": "ask",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "namespace", "name": "collaboration",
+                     "description": "Tools for spawning and managing sub-agents.",
+                     "tools": [
+                        {"type": "function", "name": "spawn_agent",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "followup_task",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "interrupt_agent",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "list_agents",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "send_message",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "wait_agent",
+                         "parameters": {"type": "object", "properties": {}}}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let tools = j["tools"].as_array().expect("tools present");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["exec", "wait", "request_user_input"]);
+    for hosted in [
+        "spawn_agent",
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "wait_agent",
+    ] {
+        assert!(!names.contains(&hosted), "{hosted} must be dropped");
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_hosted_action_dropped_outside_collaboration_namespace() {
+    // Defensive: even if a hosted action arrives as a bare top-level tool or in
+    // a differently-named namespace, it must still be dropped by name.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "function", "name": "spawn_agent",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "namespace", "name": "misc", "tools": [
+                        {"type": "function", "name": "list_agents",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "keep_me",
+                         "parameters": {"type": "object", "properties": {}}}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("tools present")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["keep_me"]);
+}
+
 // ── Codex gpt-5.6 code-mode: custom ↔ function round-trip ────────────
 #[tokio::test]
 async fn custom_tool_names_extracted_from_additional_tools() {

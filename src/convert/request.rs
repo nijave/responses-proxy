@@ -474,13 +474,18 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
             match parsed {
                 Rt::Custom(c) => {
                     if let Some(n) = c.name {
-                        names.insert(n);
+                        if !is_multi_agent_hosted_action(&n) {
+                            names.insert(n);
+                        }
                     }
                 }
                 Rt::Namespace(ns) => {
+                    let is_collab = ns.name.as_deref() == Some("collaboration");
                     for m in ns.tools.unwrap_or_default() {
                         if let NamespaceToolItem::Custom(nc) = m {
-                            names.insert(nc.name);
+                            if !is_collab && !is_multi_agent_hosted_action(&nc.name) {
+                                names.insert(nc.name);
+                            }
                         }
                     }
                 }
@@ -489,6 +494,24 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
         }
     }
     names
+}
+
+/// Hosted multi-agent collaboration actions (Responses "multi-agent" beta).
+/// These spawn and coordinate sub-agents inside OpenAI's hosted Responses
+/// runtime — the client never executes them, so a Chat Completions upstream
+/// (which has no sub-agent orchestration) cannot fulfil them. Advertising them
+/// lures the model into calls the client rejects as `unsupported call`, which
+/// derails the whole session, so they are dropped during conversion.
+fn is_multi_agent_hosted_action(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent"
+            | "send_message"
+            | "followup_task"
+            | "wait_agent"
+            | "interrupt_agent"
+            | "list_agents"
+    )
 }
 
 /// Flatten one Codex `additional_tools` entry (code-mode
@@ -505,24 +528,68 @@ fn additional_tools_to_chat_functions(v: &serde_json::Value) -> Vec<chat::ToolRe
         }
     };
     match parsed {
-        Rt::Function(f) => vec![function_tool(
-            f.name.unwrap_or_default(),
-            f.description,
-            f.parameters,
-            f.strict,
-        )],
-        Rt::Namespace(ns) => ns
-            .tools
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| match item {
-                NamespaceToolItem::Function(nf) => {
-                    function_tool(nf.name, nf.description, nf.parameters, nf.strict)
-                }
-                NamespaceToolItem::Custom(nc) => custom_as_function(nc.name, nc.description),
-            })
-            .collect(),
-        Rt::Custom(c) => vec![custom_as_function(c.name.unwrap_or_default(), c.description)],
+        Rt::Function(f) => {
+            let name = f.name.unwrap_or_default();
+            if is_multi_agent_hosted_action(&name) {
+                tracing::warn!(
+                    skipped = %name,
+                    "additional_tools: dropping hosted multi-agent tool — not executable via Chat Completions"
+                );
+                return Vec::new();
+            }
+            vec![function_tool(name, f.description, f.parameters, f.strict)]
+        }
+        Rt::Namespace(ns) => {
+            // The `collaboration` namespace carries the hosted multi-agent
+            // actions (spawn_agent, …). They run inside OpenAI's hosted
+            // Responses runtime, not the client, so a Chat Completions upstream
+            // cannot fulfil them. Drop the whole namespace so the model never
+            // emits a `spawn_agent` call the client rejects as `unsupported
+            // call` — it falls back to the client-executable tools instead.
+            let is_collab = ns.name.as_deref() == Some("collaboration");
+            let mut skipped: Vec<String> = Vec::new();
+            let out: Vec<_> = ns
+                .tools
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|item| {
+                    let name = match &item {
+                        NamespaceToolItem::Function(nf) => nf.name.as_str(),
+                        NamespaceToolItem::Custom(nc) => nc.name.as_str(),
+                    };
+                    if is_collab || is_multi_agent_hosted_action(name) {
+                        skipped.push(name.to_string());
+                        return None;
+                    }
+                    Some(match item {
+                        NamespaceToolItem::Function(nf) => {
+                            function_tool(nf.name, nf.description, nf.parameters, nf.strict)
+                        }
+                        NamespaceToolItem::Custom(nc) => {
+                            custom_as_function(nc.name, nc.description)
+                        }
+                    })
+                })
+                .collect();
+            if !skipped.is_empty() {
+                tracing::warn!(
+                    skipped = ?skipped,
+                    "additional_tools: dropping hosted multi-agent tools — not executable via Chat Completions"
+                );
+            }
+            out
+        }
+        Rt::Custom(c) => {
+            let name = c.name.unwrap_or_default();
+            if is_multi_agent_hosted_action(&name) {
+                tracing::warn!(
+                    skipped = %name,
+                    "additional_tools: dropping hosted multi-agent tool — not executable via Chat Completions"
+                );
+                return Vec::new();
+            }
+            vec![custom_as_function(name, c.description)]
+        }
         // e.g. `mcp` (remote server reference — no per-tool schema to flatten),
         // `tool_search`, `web_search`. Codex 5.6 delivers usable MCP tools as a
         // `namespace` (handled above); anything landing here has no Chat
