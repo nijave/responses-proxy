@@ -102,8 +102,16 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
 
     // gpt-5.6 code-mode: names Codex declared as custom tools (computed before
     // `req` is moved), so streamed function calls can be re-emitted as
-    // custom_tool_call. Empty for models below 5.6 → no behavior change.
-    let custom_names = crate::convert::custom_tool_names(&req.input);
+    // custom_tool_call. Restored from the previous response on a continuation
+    // turn. Empty for models below 5.6 → no behavior change.
+    let custom_names = crate::convert::resolve_custom_tool_names(
+        state,
+        &req.input,
+        req.previous_response_id.as_deref(),
+    )
+    .await;
+    // Cache alongside the tools so the next continuation restores it too.
+    let stored_custom_names = custom_names.clone();
 
     // Convert to Chat API (responses_to_chat handles history + instructions)
     let mut chat_req = match responses_to_chat(req, state).await {
@@ -187,7 +195,10 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             }
         }
 
-        state.store().put_tools(rid.clone(), response_tools).await;
+        state
+            .store()
+            .put_tools(rid.clone(), response_tools, stored_custom_names)
+            .await;
         state.store().put(rid, full_input_messages).await;
         return;
     }
@@ -342,7 +353,10 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             "WS: storing history"
         );
         full_input_messages.push(assistant_msg);
-        state.store().put_tools(rid.clone(), response_tools).await;
+        state
+            .store()
+            .put_tools(rid.clone(), response_tools, stored_custom_names)
+            .await;
         state.store().put(rid, full_input_messages).await;
     }
 }

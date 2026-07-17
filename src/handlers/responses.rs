@@ -108,6 +108,16 @@ pub async fn responses(
     // reference this response via `previous_response_id` but omit
     // `additional_tools`) can restore it. Empty for models below 5.6 → no-op.
     let response_tools = chat_req.tools.clone().unwrap_or_default();
+    // Names Codex declared as freeform `custom` tools, used to re-emit the
+    // model's `function_call` as `custom_tool_call`. Restored from the previous
+    // response on a continuation turn (see the helper) — otherwise `exec`
+    // returns as a `function_call` Codex cancels before it runs.
+    let custom_names = crate::convert::resolve_custom_tool_names(
+        &state,
+        &req.input,
+        req.previous_response_id.as_deref(),
+    )
+    .await;
     let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
     tracing::info!(
         model = %model,
@@ -148,11 +158,18 @@ pub async fn responses(
         let bg_model = model.clone();
         let bg_req = req.clone();
         let bg_rid = response_id.clone();
+        let bg_custom_names = custom_names.clone();
 
         tokio::spawn(async move {
-            let result =
-                execute_upstream_request(&bg_state, &bg_provider, chat_req, bg_model, &bg_req)
-                    .await;
+            let result = execute_upstream_request(
+                &bg_state,
+                &bg_provider,
+                chat_req,
+                bg_model,
+                &bg_req,
+                &bg_custom_names,
+            )
+            .await;
 
             match result {
                 Ok(mut resp) => {
@@ -191,6 +208,7 @@ pub async fn responses(
             req,
             full_input_messages,
             response_tools,
+            custom_names,
         )
         .await
         .map(|s| s.into_response())
@@ -203,6 +221,7 @@ pub async fn responses(
             req,
             full_input_messages,
             response_tools,
+            custom_names,
         )
         .await
         .map(|j| j.into_response())
@@ -265,6 +284,7 @@ async fn execute_upstream_request(
     chat_req: ChatRequest,
     model: String,
     original_req: &ResponsesRequest,
+    custom_names: &std::collections::HashSet<String>,
 ) -> Result<crate::types::responses::Response, String> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -307,8 +327,7 @@ async fn execute_upstream_request(
 
     // gpt-5.6 code-mode: map function_call output items back to the
     // custom_tool_call shape Codex expects (no-op for models below 5.6).
-    let custom_names = crate::convert::custom_tool_names(&original_req.input);
-    crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
+    crate::convert::remap_custom_tool_calls(&mut resp, custom_names);
 
     apply_include_filter(&mut resp, &original_req.include);
 
@@ -325,13 +344,15 @@ async fn handle_non_streaming(
     original_req: ResponsesRequest,
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
+    custom_names: std::collections::HashSet<String>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let mut resp = execute_upstream_request(state, provider, chat_req, model, &original_req)
-        .await
-        .map_err(|msg| {
-            let err = Error::server_error(msg);
-            (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-        })?;
+    let mut resp =
+        execute_upstream_request(state, provider, chat_req, model, &original_req, &custom_names)
+            .await
+            .map_err(|msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+            })?;
 
     // Persist to store if store=true (default)
     if original_req.store {
@@ -345,7 +366,7 @@ async fn handle_non_streaming(
         store_messages.extend(items_to_chat_messages(&output_inputs, state));
         state
             .store()
-            .put_tools(resp.id.clone(), response_tools)
+            .put_tools(resp.id.clone(), response_tools, custom_names)
             .await;
         state.store().put(resp.id.clone(), store_messages).await;
     }
@@ -384,6 +405,7 @@ async fn handle_streaming(
     original_req: ResponsesRequest,
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
+    custom_names: std::collections::HashSet<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -428,7 +450,8 @@ async fn handle_streaming(
     // Register cancellation token so POST /v1/responses/{id}/cancel can stop this stream
     let cancel_rx = store.register_cancel_token(&rid).await;
 
-    let custom_names = crate::convert::custom_tool_names(&original_req.input);
+    // Cache alongside the tools so the next continuation restores it too.
+    let store_custom_names = custom_names.clone();
 
     tokio::spawn(async move {
         let mut buf = String::new();
@@ -543,7 +566,11 @@ async fn handle_streaming(
                                         let out = output_to_input_items(&final_resp.output);
                                         msgs.extend(items_to_chat_messages(&out, &bg_state));
                                         store
-                                            .put_tools(rid.clone(), response_tools.clone())
+                                            .put_tools(
+                                                rid.clone(),
+                                                response_tools.clone(),
+                                                store_custom_names.clone(),
+                                            )
                                             .await;
                                         store.put(rid.clone(), msgs).await;
                                     }
@@ -615,7 +642,11 @@ async fn handle_streaming(
             );
             msgs.extend(chat_msgs);
             store
-                .put_tools(rid.clone(), response_tools.clone())
+                .put_tools(
+                    rid.clone(),
+                    response_tools.clone(),
+                    store_custom_names.clone(),
+                )
                 .await;
             store.put(rid.clone(), msgs).await;
         }

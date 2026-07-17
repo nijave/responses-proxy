@@ -121,8 +121,10 @@ pub async fn responses_to_chat(
     let mut additional_tool_defs: Vec<serde_json::Value> = Vec::new();
 
     // Names Codex declared as custom (code-mode) — used to keep replayed history
-    // calls consistent with the `{ input }` function schema we present.
-    let custom_names = custom_tool_names(&req.input);
+    // calls consistent with the `{ input }` function schema we present. Restored
+    // from the previous response on a continuation turn (see the helper).
+    let custom_names =
+        resolve_custom_tool_names(state, &req.input, req.previous_response_id.as_deref()).await;
 
     // Walk input items
     let items: Vec<InputItem> = req.input;
@@ -510,6 +512,27 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
                 _ => {}
             }
         }
+    }
+    names
+}
+
+/// [`custom_tool_names`] for the current turn, falling back to the set cached
+/// under `previous_response_id` when the turn brought none. Codex sends
+/// `additional_tools` only on a new user turn; a tool-result continuation omits
+/// them, so without the fallback `exec` would round-trip as a `function_call`
+/// Codex cancels instead of the `custom_tool_call` it declared. Empty for models
+/// below 5.6, which never cache a set.
+pub async fn resolve_custom_tool_names(
+    state: &crate::app::State,
+    input: &[InputItem],
+    previous_response_id: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let names = custom_tool_names(input);
+    if names.is_empty()
+        && let Some(prev_id) = previous_response_id
+        && let Some(cached) = state.store().get_custom_names(prev_id).await
+    {
+        return cached;
     }
     names
 }
@@ -1037,11 +1060,14 @@ pub fn items_to_chat_messages(
             // Trigger for remote compaction v2 — handled upstream of conversion.
             InputItem::CompactionTrigger(_) => {}
             // Items Codex replays every turn with no Chat-Completions
-            // equivalent. Drop silently — large opaque payloads.
+            // equivalent. Drop silently — large opaque payloads. `additional_tools`
+            // carries tool definitions (hoisted into chat tools elsewhere), not a
+            // message, so it belongs here rather than in the warn fallback.
             InputItem::WebSearchCall(_)
             | InputItem::ImageGenerationCall(_)
             | InputItem::ToolSearchCall(_)
-            | InputItem::ToolSearchOutput(_) => {}
+            | InputItem::ToolSearchOutput(_)
+            | InputItem::AdditionalTools(_) => {}
             other => {
                 tracing::warn!(
                     item = %unconvertible_item_label(other),

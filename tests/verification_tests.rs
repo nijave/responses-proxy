@@ -460,12 +460,16 @@ async fn code_mode_tools_restored_on_continuation_turn() {
         ]
     }))
     .unwrap();
+    let turn1_input = turn1.input.clone();
     let chat1 = responses_to_chat(turn1, &state).await.unwrap();
     let tools1 = chat1.tools.clone().expect("turn 1 has tools");
     assert_eq!(tools1.len(), 2);
+    // Cache exactly as the handler does: tools + the custom-name set.
+    let custom_names1 = responses_proxy::convert::custom_tool_names(&turn1_input);
+    assert!(custom_names1.contains("exec"));
     state
         .store()
-        .put_tools("resp_turn1".to_string(), tools1)
+        .put_tools("resp_turn1".to_string(), tools1, custom_names1)
         .await;
 
     // Turn 2: continuation — no additional_tools, references the prior response.
@@ -486,6 +490,50 @@ async fn code_mode_tools_restored_on_continuation_turn() {
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["exec", "wait"]);
+
+    // The custom-name set is restorable too, so the continuation's `exec`
+    // response is re-emitted as a custom_tool_call rather than a function_call
+    // (which Codex would cancel).
+    let restored = state
+        .store()
+        .get_custom_names("resp_turn1")
+        .await
+        .expect("custom names cached");
+    assert!(restored.contains("exec"));
+}
+
+#[tokio::test]
+async fn resolve_custom_tool_names_falls_back_to_cached() {
+    use responses_proxy::types::item::InputItem;
+    let state = test_state();
+
+    // Fresh turn with additional_tools resolves directly and is cached.
+    let fresh: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "custom", "name": "exec"}
+        ]}
+    ]))
+    .unwrap();
+    let names = responses_proxy::convert::resolve_custom_tool_names(&state, &fresh, None).await;
+    assert!(names.contains("exec"));
+    state
+        .store()
+        .put_tools("resp_a".to_string(), vec![], names)
+        .await;
+
+    // Continuation (no additional_tools) falls back to the cached set.
+    let cont: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+    ]))
+    .unwrap();
+    let restored =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, Some("resp_a")).await;
+    assert!(restored.contains("exec"));
+
+    // Unknown previous id → no invention.
+    let none =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, Some("resp_x")).await;
+    assert!(none.is_empty());
 }
 
 #[tokio::test]

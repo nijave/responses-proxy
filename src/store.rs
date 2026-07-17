@@ -23,6 +23,10 @@ struct StoredMessages {
 #[derive(Clone)]
 struct StoredTools {
     tools: Vec<ToolRequest>,
+    /// Names Codex declared as freeform `custom` tools (code-mode `exec` etc.).
+    /// Needed to re-emit the model's `function_call` as the `custom_tool_call`
+    /// shape Codex expects; without it Codex cancels the call it didn't declare.
+    custom_names: std::collections::HashSet<String>,
     created_at: Instant,
 }
 
@@ -97,16 +101,23 @@ impl Store {
         }
     }
 
-    /// Cache the gpt-5.6 code-mode tool registry for a response ID. No-op for an
-    /// empty list so non-code-mode turns don't allocate entries.
-    pub async fn put_tools(&self, id: String, tools: Vec<ToolRequest>) {
-        if tools.is_empty() {
+    /// Cache the gpt-5.6 code-mode tool registry and its custom-tool name set for
+    /// a response ID. No-op when both are empty so non-code-mode turns don't
+    /// allocate entries.
+    pub async fn put_tools(
+        &self,
+        id: String,
+        tools: Vec<ToolRequest>,
+        custom_names: std::collections::HashSet<String>,
+    ) {
+        if tools.is_empty() && custom_names.is_empty() {
             return;
         }
         self.tools.write().await.insert(
             id,
             StoredTools {
                 tools,
+                custom_names,
                 created_at: Instant::now(),
             },
         );
@@ -119,6 +130,19 @@ impl Store {
         let entry = g.get(id)?;
         if entry.created_at.elapsed() <= self.ttl {
             return Some(entry.tools.clone());
+        }
+        drop(g);
+        self.tools.write().await.remove(id);
+        None
+    }
+
+    /// Retrieve the cached custom-tool name set by ID. Returns None if not found
+    /// or expired.
+    pub async fn get_custom_names(&self, id: &str) -> Option<std::collections::HashSet<String>> {
+        let g = self.tools.read().await;
+        let entry = g.get(id)?;
+        if entry.created_at.elapsed() <= self.ttl {
+            return Some(entry.custom_names.clone());
         }
         drop(g);
         self.tools.write().await.remove(id);
