@@ -59,6 +59,12 @@ pub struct StreamState {
     /// as `function` calls; for these names the client-facing events are emitted
     /// as `custom_tool_call` instead (see [`emit_tool_call_deltas`]).
     pub custom_tool_names: HashSet<String>,
+    /// `(full_chars, sent_chars)` content-character counts from before/after
+    /// truncation. When set, the upstream's real `input_tokens` is scaled up by
+    /// `full/sent` so the reported context size tracks the upstream tokenizer
+    /// (Codex gates auto-compaction on it). `None` leaves usage untouched. See
+    /// `handlers::apply_input_char_scale`.
+    pub input_char_scale: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -789,7 +795,12 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
     response.incomplete_details = incomplete_details;
 
     if let Some(ref usage) = state.usage {
-        response.usage = Some(super::responses::Usage::from(usage.clone()));
+        let mut u = super::responses::Usage::from(usage.clone());
+        // Scale the upstream's real input_tokens back up by the full/sent
+        // character ratio so Codex's auto-compaction threshold, which keys off
+        // server-reported total_tokens, fires on time even when we truncated.
+        crate::handlers::apply_input_char_scale(Some(&mut u), state.input_char_scale);
+        response.usage = Some(u);
     }
 
     match final_status {

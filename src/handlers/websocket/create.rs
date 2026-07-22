@@ -128,6 +128,11 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         }
     };
     chat_req.model = provider.model.clone();
+    // Content-character size before truncation. When we truncate, the upstream's
+    // real input_tokens is scaled up by full/sent so Codex's auto-compaction
+    // threshold (keyed off server-reported total_tokens) fires on time instead
+    // of being masked by our truncation.
+    let full_chars = crate::handlers::input_tokens::content_chars(&chat_req.messages);
     let dropped =
         crate::convert::enforce_message_budget(&mut chat_req.messages, provider.max_input_messages);
     if dropped > 0 {
@@ -137,8 +142,9 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             "Input exceeded history.max-input-messages — dropped oldest turns"
         );
     }
+    let mut shrunk = 0;
     if let Some(max_chars) = provider.max_input_chars {
-        let shrunk = crate::convert::enforce_input_budget(&mut chat_req.messages, max_chars);
+        shrunk = crate::convert::enforce_input_budget(&mut chat_req.messages, max_chars);
         if shrunk > 0 {
             tracing::info!(
                 max_chars,
@@ -147,6 +153,9 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             );
         }
     }
+    let sent_chars = crate::handlers::input_tokens::content_chars(&chat_req.messages);
+    let input_char_scale =
+        (dropped > 0 || shrunk > 0).then_some((full_chars as u64, sent_chars as u64));
     let mut full_input_messages = chat_req.messages.clone();
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
@@ -324,6 +333,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         now,
         compact_key: state.compact_key(),
         custom_tool_names: custom_names,
+        input_char_scale,
     };
     let (response_msg, cancelled, stream_events) =
         run_stream(socket, stream_resp, stream_context, cancel_rx).await;
@@ -372,6 +382,7 @@ struct WsStreamContext<'a> {
     now: i64,
     compact_key: Option<&'a [u8; 32]>,
     custom_tool_names: std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
 }
 
 async fn run_stream(
@@ -390,6 +401,7 @@ async fn run_stream(
     ss.created = context.now;
     ss.compact_key = context.compact_key.copied();
     ss.custom_tool_names = context.custom_tool_names;
+    ss.input_char_scale = context.input_char_scale;
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
     let mut collected_events: Vec<StreamEvent> = Vec::new();

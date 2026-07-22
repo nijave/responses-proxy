@@ -32,17 +32,44 @@ pub async fn input_tokens(
 /// Estimate token count from a Chat API request.
 /// Falls back to chars/4 when no tokenizer is available.
 fn estimate_tokens(req: &chat::Request) -> i64 {
-    let mut total_chars: usize = 0;
-
-    for msg in &req.messages {
-        total_chars += count_message_chars(msg);
-    }
-
-    // Rough heuristic: ~4 characters per token for English text
+    let total_chars = content_chars(&req.messages);
     if total_chars == 0 {
         0
     } else {
         (total_chars / 4).max(1) as i64
+    }
+}
+
+/// Total content-character count of a converted Chat message list. Used to
+/// compute the dropped/kept ratio when reporting the true pre-truncation
+/// context size back to Codex (see `handlers::responses`).
+pub(crate) fn content_chars(messages: &[chat::MessageRequest]) -> usize {
+    messages.iter().map(count_message_chars).sum()
+}
+
+/// When history was truncated before forwarding, the upstream counts only the
+/// shrunken input, so its `usage` under-reports the true context size. Codex
+/// gates auto-compaction on the server-reported `total_tokens`, so we scale the
+/// upstream's real `input_tokens` back up by the `(full_chars, sent_chars)`
+/// ratio — calibrating against the upstream's own tokenizer rather than a
+/// hardcoded chars-per-token constant — and recompute `total`. No-op when
+/// `scale` is `None` (nothing was truncated), usage is absent, or the ratio
+/// wouldn't grow the count.
+///
+/// If this ratio proves inaccurate for some languages we can switch to a real
+/// tokenizer such as tiktoken-rs.
+pub(crate) fn apply_input_char_scale(
+    usage: Option<&mut crate::types::responses::Usage>,
+    scale: Option<(u64, u64)>,
+) {
+    if let (Some(u), Some((full_chars, sent_chars))) = (usage, scale) {
+        if sent_chars == 0 || full_chars <= sent_chars {
+            return;
+        }
+        let scaled =
+            ((u.input_tokens as f64) * (full_chars as f64) / (sent_chars as f64)).round() as i64;
+        u.input_tokens = scaled;
+        u.total_tokens = scaled + u.output_tokens;
     }
 }
 
@@ -94,5 +121,58 @@ fn count_assistant_content(c: &chat::AssistantContent) -> usize {
                 _ => 0,
             })
             .sum(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::responses::{
+        InputTokensDetails, OutputTokensDetails, Usage,
+    };
+
+    fn usage(input: i64, output: i64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn scales_input_tokens_by_full_sent_ratio() {
+        let mut u = usage(1000, 200);
+        // Sent 4000 chars but the full history was 12000 → 3× → 3000 tokens.
+        apply_input_char_scale(Some(&mut u), Some((12000, 4000)));
+        assert_eq!(u.input_tokens, 3000);
+        assert_eq!(u.total_tokens, 3200);
+    }
+
+    #[test]
+    fn no_op_when_scale_is_none() {
+        let mut u = usage(1000, 200);
+        apply_input_char_scale(Some(&mut u), None);
+        assert_eq!(u.input_tokens, 1000);
+        assert_eq!(u.total_tokens, 1200);
+    }
+
+    #[test]
+    fn no_op_when_nothing_was_truncated() {
+        // full == sent: truncation removed nothing, so leave usage untouched.
+        let mut u = usage(1000, 200);
+        apply_input_char_scale(Some(&mut u), Some((4000, 4000)));
+        assert_eq!(u.input_tokens, 1000);
+        assert_eq!(u.total_tokens, 1200);
+    }
+
+    #[test]
+    fn no_op_when_sent_chars_zero() {
+        let mut u = usage(1000, 200);
+        apply_input_char_scale(Some(&mut u), Some((4000, 0)));
+        assert_eq!(u.input_tokens, 1000);
     }
 }

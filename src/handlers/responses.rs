@@ -71,7 +71,7 @@ pub async fn responses(
     let endpoint = format!("{}/chat/completions", provider.base_url);
 
     // Build chat request (responses_to_chat fetches history + handles instructions)
-    let (chat_req, full_input_messages) = {
+    let (chat_req, full_input_messages, input_char_scale) = {
         let mut cr = responses_to_chat(req.clone(), &state)
             .await
             .map_err(|unsupported| {
@@ -82,6 +82,16 @@ pub async fn responses(
                 (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
             })?;
         cr.model = provider_model.clone();
+        // Measure the content-character size BEFORE truncation. Codex compares
+        // the server-reported `usage.total_tokens` against its auto-compaction
+        // threshold; if we truncate and pass the upstream's smaller count
+        // through, that threshold never fires and history grows unbounded. When
+        // truncation actually removes content we scale the upstream's real
+        // prompt-token count back up by the full/sent character ratio, so the
+        // number we report tracks the upstream's own tokenizer instead of a
+        // hardcoded chars-per-token guess. (If this ratio proves inaccurate for
+        // some languages we can switch to a real tokenizer like tiktoken-rs.)
+        let full_chars = super::input_tokens::content_chars(&cr.messages);
         let dropped =
             crate::convert::enforce_message_budget(&mut cr.messages, provider.max_input_messages);
         if dropped > 0 {
@@ -91,8 +101,9 @@ pub async fn responses(
                 "Input exceeded history.max-input-messages — dropped oldest turns"
             );
         }
+        let mut shrunk = 0;
         if let Some(max_chars) = provider.max_input_chars {
-            let shrunk = crate::convert::enforce_input_budget(&mut cr.messages, max_chars);
+            shrunk = crate::convert::enforce_input_budget(&mut cr.messages, max_chars);
             if shrunk > 0 {
                 tracing::info!(
                     max_chars,
@@ -101,8 +112,11 @@ pub async fn responses(
                 );
             }
         }
+        let sent_chars = super::input_tokens::content_chars(&cr.messages);
+        let input_char_scale =
+            (dropped > 0 || shrunk > 0).then_some((full_chars as u64, sent_chars as u64));
         let input_msgs = cr.messages.clone();
-        (cr, input_msgs)
+        (cr, input_msgs, input_char_scale)
     };
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
@@ -119,6 +133,12 @@ pub async fn responses(
     )
     .await;
     let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
+    // Codex sends its auto-compaction threshold here; log it to confirm on live
+    // runs that the client drives compaction off our reported usage.
+    let compact_threshold = req
+        .context_management
+        .as_ref()
+        .and_then(|cm| cm.iter().find_map(|c| c.compact_threshold));
     tracing::info!(
         model = %model,
         upstream = %provider_model,
@@ -127,6 +147,8 @@ pub async fn responses(
         tool_output_chars,
         stream = is_stream,
         endpoint = %endpoint,
+        input_char_scale = ?input_char_scale,
+        compact_threshold = ?compact_threshold,
         "Forwarding request"
     );
 
@@ -168,6 +190,7 @@ pub async fn responses(
                 bg_model,
                 &bg_req,
                 &bg_custom_names,
+                input_char_scale,
             )
             .await;
 
@@ -209,6 +232,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
+            input_char_scale,
         )
         .await
         .map(|s| s.into_response())
@@ -222,6 +246,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
+            input_char_scale,
         )
         .await
         .map(|j| j.into_response())
@@ -285,15 +310,17 @@ async fn execute_upstream_request(
     model: String,
     original_req: &ResponsesRequest,
     custom_names: &std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
 ) -> Result<crate::types::responses::Response, String> {
     let url = format!("{}/chat/completions", provider.base_url);
 
     let request = state
         .http_client()
-        .post(url)
+        .post(&url)
         .timeout(provider.timeout)
         .header("Authorization", format!("Bearer {}", provider.api_key))
         .header("Content-Type", "application/json");
+    let started = std::time::Instant::now();
     let response = send_chat_request(request, &chat_req, provider)
         .map_err(|e| e.to_string())?
         .send()
@@ -304,14 +331,17 @@ async fn execute_upstream_request(
     let body = response.text().await.map_err(|e| e.to_string())?;
 
     if !status.is_success() {
-        return Err(format!(
-            "Upstream returned {status}: {}",
-            if body.len() > 200 {
-                &body[..200]
-            } else {
-                &body
-            }
-        ));
+        let snippet = if body.len() > 200 { &body[..200] } else { &body };
+        tracing::warn!(
+            endpoint = %url,
+            model = %provider.model,
+            upstream_status = status.as_u16(),
+            streaming = false,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            snippet = %snippet,
+            "Upstream request failed"
+        );
+        return Err(format!("Upstream returned {status}: {snippet}"));
     }
 
     let chat_resp: ChatCompletionResponse = if provider.rewrite.chat_in.is_empty() {
@@ -324,6 +354,7 @@ async fn execute_upstream_request(
     };
 
     let mut resp = chat_to_responses(chat_resp, model, state.compact_key());
+    super::input_tokens::apply_input_char_scale(resp.usage.as_mut(), input_char_scale);
 
     // gpt-5.6 code-mode: map function_call output items back to the
     // custom_tool_call shape Codex expects (no-op for models below 5.6).
@@ -345,14 +376,22 @@ async fn handle_non_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let mut resp =
-        execute_upstream_request(state, provider, chat_req, model, &original_req, &custom_names)
-            .await
-            .map_err(|msg| {
-                let err = Error::server_error(msg);
-                (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-            })?;
+    let mut resp = execute_upstream_request(
+        state,
+        provider,
+        chat_req,
+        model,
+        &original_req,
+        &custom_names,
+        input_char_scale,
+    )
+    .await
+    .map_err(|msg| {
+        let err = Error::server_error(msg);
+        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+    })?;
 
     // Persist to store if store=true (default)
     if original_req.store {
@@ -406,15 +445,17 @@ async fn handle_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let url = format!("{}/chat/completions", provider.base_url);
 
     let request = state
         .http_client()
-        .post(url)
+        .post(&url)
         .timeout(provider.timeout)
         .header("Authorization", format!("Bearer {}", provider.api_key))
         .header("Content-Type", "application/json");
+    let started = std::time::Instant::now();
     let response = send_chat_request(request, &chat_req, provider)
         .map_err(|message| {
             let err = Error::server_error(message);
@@ -431,6 +472,15 @@ async fn handle_streaming(
         let s = response.status();
         let b = response.text().await.unwrap_or_default();
         let truncated = if b.len() > 200 { &b[..200] } else { &b };
+        tracing::warn!(
+            endpoint = %url,
+            model = %provider.model,
+            upstream_status = s.as_u16(),
+            streaming = true,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            snippet = %truncated,
+            "Upstream request failed"
+        );
         let err = Error::server_error(format!("Upstream returned {}: {}", s.as_u16(), truncated));
         return Err((StatusCode::BAD_GATEWAY, Json(err.to_http_json())));
     }
@@ -466,6 +516,7 @@ async fn handle_streaming(
             .as_secs() as i64;
         ss.has_started = true;
         ss.compact_key = bg_state.compact_key().copied();
+        ss.input_char_scale = input_char_scale;
 
         let start_response =
             build_stream_lifecycle_response(&rid, &model, ss.created, ResponseStatus::InProgress);

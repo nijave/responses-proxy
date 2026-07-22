@@ -1,5 +1,5 @@
 use crate::config::ResolvedProvider;
-use crate::types::chat::{self, Completion, MessageRequest};
+use crate::types::chat::{self, MessageRequest};
 use crate::types::item::{Compaction, OutputContentBlock, OutputItem, OutputMessage};
 use crate::types::responses::{self, CompactedResponse, Error, Request};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
@@ -94,80 +94,75 @@ pub(crate) async fn build_compaction_output(
         crate::convert::enforce_input_budget(&mut messages, max_chars);
     }
 
-    // Build upstream request (non-streaming, no tools, reasoning disabled)
+    // Build upstream request. Send it **streaming**: the summary can be up to
+    // `max_tokens` long, and on a slow origin behind Cloudflare a buffered
+    // (non-streaming) call blows past the ~100s origin-timeout window → 524,
+    // which kills compaction and traps Codex in a retry loop. Streaming emits
+    // the first byte quickly and keeps the connection alive.
     let upstream_req = chat::Request {
         model: provider.model.clone(),
         messages,
         max_tokens: Some(33000),
+        stream: Some(true),
+        stream_options: Some(chat::StreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        }),
         ..Default::default()
     };
 
-    // Send to upstream Chat API (apply chat-out rewrite if configured)
     let url = format!("{}/chat/completions", provider.base_url);
-    let request = state
-        .http_client()
-        .post(&url)
-        .timeout(provider.timeout)
-        .header("Authorization", format!("Bearer {}", provider.api_key))
-        .header("Content-Type", "application/json");
-    let request = if provider.rewrite.chat_out.is_empty() {
-        request.json(&upstream_req)
-    } else {
-        let mut body = serde_json::to_value(&upstream_req).map_err(|e| {
-            let err = Error::server_error(e.to_string());
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-        })?;
-        crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out).map_err(|msg| {
+    let request = crate::upstream::build_typed_chat_request(state.http_client(), provider, &upstream_req)
+        .map_err(|msg| {
             let err = Error::server_error(msg);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
         })?;
-        request.json(&body)
-    };
+    let started = std::time::Instant::now();
     let response = request.send().await.map_err(|e| {
         let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
 
     let status = response.status();
-    let body_text = response.text().await.map_err(|e| {
-        let err = Error::server_error(e.to_string());
-        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-    })?;
-
     if !status.is_success() {
-        let err = Error::server_error(format!("Upstream returned {status}: {body_text}"));
+        let body_text = response.text().await.unwrap_or_default();
+        let snippet = if body_text.len() > 200 {
+            &body_text[..200]
+        } else {
+            &body_text
+        };
+        tracing::warn!(
+            endpoint = %url,
+            model = %provider.model,
+            upstream_status = status.as_u16(),
+            streaming = true,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            snippet = %snippet,
+            "Compaction upstream request failed"
+        );
+        let err = Error::server_error(format!("Upstream returned {status}: {snippet}"));
         return Err((StatusCode::BAD_GATEWAY, Json(err.to_http_json())));
     }
 
-    // Apply chat-in rewrite if configured
-    let chat_resp: Completion = if provider.rewrite.chat_in.is_empty() {
-        serde_json::from_str(&body_text)
-    } else {
-        let mut resp_value: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
-            let err = Error::server_error(e.to_string());
+    // Drain the SSE stream into an accumulator (client-facing events discarded).
+    let ss = crate::upstream::drain_chat_stream(response, &provider.rewrite.chat_in)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                endpoint = %url,
+                model = %provider.model,
+                streaming = true,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "Compaction upstream stream drain failed"
+            );
+            let err = Error::server_error(e);
             (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
         })?;
-        crate::rewrite::apply_rewrite(&mut resp_value, &provider.rewrite.chat_in).map_err(
-            |msg| {
-                let err = Error::server_error(msg);
-                (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-            },
-        )?;
-        serde_json::from_value(resp_value)
-    }
-    .map_err(|e| {
-        let err = Error::server_error(e.to_string());
-        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-    })?;
 
-    // Extract the summary text from the upstream response
-    let summary_text = chat_resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
+    let summary_text = ss.accumulated_text.as_str();
 
-    let usage = match chat_resp.usage {
+    let usage = match ss.usage {
         Some(u) => responses::Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -187,6 +182,7 @@ pub(crate) async fn build_compaction_output(
             },
         },
     };
+    let created = ss.created;
 
     let compaction_id = format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
 
@@ -222,5 +218,5 @@ pub(crate) async fn build_compaction_output(
         })]
     };
 
-    Ok((output, usage, chat_resp.created))
+    Ok((output, usage, created))
 }
