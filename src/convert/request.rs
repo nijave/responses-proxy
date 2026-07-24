@@ -493,19 +493,18 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
             };
             match parsed {
                 Rt::Custom(c) => {
-                    if let Some(n) = c.name {
-                        if !is_multi_agent_hosted_action(&n) {
-                            names.insert(n);
-                        }
+                    if let Some(n) = c.name.filter(|n| !is_multi_agent_hosted_action(n)) {
+                        names.insert(n);
                     }
                 }
                 Rt::Namespace(ns) => {
                     let is_collab = ns.name.as_deref() == Some("collaboration");
                     for m in ns.tools.unwrap_or_default() {
-                        if let NamespaceToolItem::Custom(nc) = m {
-                            if !is_collab && !is_multi_agent_hosted_action(&nc.name) {
-                                names.insert(nc.name);
-                            }
+                        let NamespaceToolItem::Custom(nc) = m else {
+                            continue;
+                        };
+                        if !is_collab && !is_multi_agent_hosted_action(&nc.name) {
+                            names.insert(nc.name);
                         }
                     }
                 }

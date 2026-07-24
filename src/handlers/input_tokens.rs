@@ -127,9 +127,7 @@ fn count_assistant_content(c: &chat::AssistantContent) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::responses::{
-        InputTokensDetails, OutputTokensDetails, Usage,
-    };
+    use crate::types::responses::{InputTokensDetails, OutputTokensDetails, Usage};
 
     fn usage(input: i64, output: i64) -> Usage {
         Usage {

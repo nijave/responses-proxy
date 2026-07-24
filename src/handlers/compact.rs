@@ -82,7 +82,8 @@ pub(crate) async fn build_compaction_output(
     // drop oldest turns to fit the message-count limit, then shrink old tool
     // outputs to the char budget. The summary prompt is the trailing user turn,
     // so it is always retained.
-    let dropped = crate::convert::enforce_message_budget(&mut messages, provider.max_input_messages);
+    let dropped =
+        crate::convert::enforce_message_budget(&mut messages, provider.max_input_messages);
     if dropped > 0 {
         tracing::info!(
             max_messages = provider.max_input_messages,
@@ -112,11 +113,12 @@ pub(crate) async fn build_compaction_output(
     };
 
     let url = format!("{}/chat/completions", provider.base_url);
-    let request = crate::upstream::build_typed_chat_request(state.http_client(), provider, &upstream_req)
-        .map_err(|msg| {
-            let err = Error::server_error(msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-        })?;
+    let request =
+        crate::upstream::build_typed_chat_request(state.http_client(), provider, &upstream_req)
+            .map_err(|msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
     let started = std::time::Instant::now();
     let response = request.send().await.map_err(|e| {
         let err = Error::server_error(e.to_string());

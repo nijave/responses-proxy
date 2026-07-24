@@ -331,7 +331,11 @@ async fn execute_upstream_request(
     let body = response.text().await.map_err(|e| e.to_string())?;
 
     if !status.is_success() {
-        let snippet = if body.len() > 200 { &body[..200] } else { &body };
+        let snippet = if body.len() > 200 {
+            &body[..200]
+        } else {
+            &body
+        };
         tracing::warn!(
             endpoint = %url,
             model = %provider.model,
@@ -367,6 +371,7 @@ async fn execute_upstream_request(
 
 // ── Non-streaming handler ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_streaming(
     state: &crate::app::State,
     provider: &crate::config::ResolvedProvider,
@@ -436,6 +441,7 @@ async fn handle_non_streaming(
 
 // ── Streaming (SSE) handler ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_streaming(
     state: &crate::app::State,
     provider: &crate::config::ResolvedProvider,

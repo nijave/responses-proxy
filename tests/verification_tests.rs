@@ -330,7 +330,11 @@ async fn mcp_namespace_tools_flattened_to_chat_functions() {
     let j = serde_json::to_value(&chat).unwrap();
     let tools = j["tools"].as_array().expect("tools present");
 
-    assert_eq!(tools.len(), 1, "namespace member kept, mcp server ref dropped");
+    assert_eq!(
+        tools.len(),
+        1,
+        "namespace member kept, mcp server ref dropped"
+    );
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "mcp__github__list_issues");
     assert_eq!(
@@ -599,7 +603,10 @@ async fn nonstreaming_function_call_remapped_to_custom_by_name() {
     assert_eq!(exec["type"], "custom_tool_call");
     assert_eq!(exec["input"], "pwd", "the {{input}} wrapper is unwrapped");
     let plan = out.iter().find(|i| i["name"] == "update_plan").unwrap();
-    assert_eq!(plan["type"], "function_call", "non-custom names stay function");
+    assert_eq!(
+        plan["type"], "function_call",
+        "non-custom names stay function"
+    );
 }
 
 #[tokio::test]
@@ -634,16 +641,30 @@ async fn streaming_custom_tool_emits_custom_tool_call_events() {
 
     let types: Vec<String> = events
         .iter()
-        .map(|e| serde_json::to_value(e).unwrap()["type"].as_str().unwrap().to_string())
+        .map(|e| {
+            serde_json::to_value(e).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     // Custom tool call, not a function call, on the wire.
-    assert!(types.iter().any(|t| t == "response.custom_tool_call_input.done"));
     assert!(
-        !types.iter().any(|t| t == "response.function_call_arguments.delta"),
+        types
+            .iter()
+            .any(|t| t == "response.custom_tool_call_input.done")
+    );
+    assert!(
+        !types
+            .iter()
+            .any(|t| t == "response.function_call_arguments.delta"),
         "function arg deltas must be suppressed for custom tools"
     );
 
-    let jsons: Vec<serde_json::Value> = events.iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    let jsons: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
     let added = jsons
         .iter()
         .find(|e| e["type"] == "response.output_item.added")
@@ -680,7 +701,9 @@ async fn history_custom_tool_call_wrapped_as_input_json() {
     let j = serde_json::to_value(&chat).unwrap();
     let msgs = j["messages"].as_array().unwrap();
     let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
-    let args = assistant["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+    let args = assistant["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
     assert_eq!(parsed["input"], "tools.exec_command({cmd:[\"pwd\"]})");
 }

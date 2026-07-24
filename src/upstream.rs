@@ -1,6 +1,6 @@
 //! Shared upstream Chat Completions API request builder.
 
-use crate::config::{RewriteConfig, ResolvedProvider};
+use crate::config::{ResolvedProvider, RewriteConfig};
 use crate::types::chat;
 use crate::types::streaming::{StreamState, process_upstream_stream_data};
 use futures::StreamExt;
