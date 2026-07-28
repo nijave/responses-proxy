@@ -14,5 +14,6 @@ pub use compact::compact;
 pub(crate) use input_tokens::apply_input_char_scale;
 pub use input_tokens::input_tokens;
 pub(crate) use responses::compaction_output_to_chat_messages;
+pub(crate) use responses::response_to_stream_events;
 pub use responses::responses;
 pub use websocket::websocket;

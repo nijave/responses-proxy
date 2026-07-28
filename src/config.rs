@@ -101,6 +101,13 @@ pub struct ModelEntry {
     pub rewrite: Option<RewriteEntry>,
     #[serde(default)]
     pub history: Option<HistoryConfig>,
+    /// Whether the upstream can stream structured output (`response_format`
+    /// json_schema/json_object with `stream: true`). Some gateways reject that
+    /// combination; set `false` and the proxy fetches the response
+    /// non-streamed, then re-emits it to the client as a single SSE burst.
+    /// Defaults to `true` (pass streaming through unchanged).
+    #[serde(default, rename = "stream-structured-output")]
+    pub stream_structured_output: Option<bool>,
 }
 
 /// Per-model history controls. `max-input-chars` caps the total size of the
@@ -551,6 +558,9 @@ pub struct ResolvedProvider {
     pub max_input_chars: Option<usize>,
     /// Maximum number of messages in the converted Chat request. 0 = unlimited.
     pub max_input_messages: usize,
+    /// Whether the upstream can stream structured output. When `false`, the
+    /// proxy buffers a non-streamed upstream response and replays it as SSE.
+    pub stream_structured_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +634,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
             .as_ref()
             .map(|h| h.max_input_messages)
             .unwrap_or_else(default_max_input_messages);
+        let stream_structured_output = entry.stream_structured_output.unwrap_or(true);
 
         models.insert(
             logical_name.clone(),
@@ -635,6 +646,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 rewrite,
                 max_input_chars,
                 max_input_messages,
+                stream_structured_output,
             },
         );
         model_names.push(logical_name.clone());

@@ -155,6 +155,10 @@ models:
     # Example of exposing another logical model backed by a different
     # downstream model on the same provider.
     model: deepseek-v4-flash
+    # If the upstream 500s on `stream: true` + a structured `response_format`,
+    # set this to false and the proxy buffers a non-streamed reply and replays
+    # it as SSE. Defaults to true (stream through unchanged).
+    # stream-structured-output: true
     provider:
       api-key: $DEEPSEEK_API_KEY
       base-url: https://api.deepseek.com

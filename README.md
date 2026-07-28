@@ -106,6 +106,10 @@ models:
       base-url: https://api.deepseek.com
       api-key: $DEEPSEEK_API_KEY
     model: deepseek-v4-flash
+    # Set to false if the upstream rejects `stream: true` together with a
+    # structured `response_format`; the proxy then buffers a non-streamed
+    # reply and replays it as SSE. Defaults to true (stream through unchanged).
+    # stream-structured-output: true
 ```
 
 ### Rewrite Rules
@@ -218,6 +222,8 @@ rewrites:
 ## Streaming
 
 Set `"stream": true` in the Responses API request. The proxy converts Chat API SSE chunks into Responses API streaming events (`response.created` → `response.output_text.delta` → `response.completed`). Tool call deltas are accumulated across chunks and emitted in the final event.
+
+**Structured output over streaming.** Some gateways reject `stream: true` combined with a structured `response_format` (`json_schema` / `json_object`) — a request pattern Codex's Guardian judge uses. Set `stream-structured-output: false` on the affected model and the proxy fetches that reply non-streamed, then replays it to the client as a single SSE burst (`response.created` → `response.output_text.delta` → `response.completed`). This is transparent to the client, and streaming deltas are of no use for structured output anyway (partial JSON isn't parseable). The default is `true`, so providers that stream structured output natively (e.g. OpenAI) are unaffected.
 
 ## History & Compaction
 

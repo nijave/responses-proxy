@@ -168,6 +168,7 @@ async fn spawn_proxy(chat_base_url: String) -> String {
             rewrite: Default::default(),
             max_input_chars: None,
             max_input_messages: 1000,
+            stream_structured_output: true,
         },
     );
 

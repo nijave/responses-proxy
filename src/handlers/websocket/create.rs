@@ -212,6 +212,34 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         return;
     }
 
+    // Buffered path for upstreams that can't stream structured output — the same
+    // limitation the HTTP handler works around. When the provider is flagged
+    // `stream-structured-output: false` and this request carries a structured
+    // `response_format`, fetch the reply non-streamed and replay the canonical
+    // lifecycle over the socket.
+    let buffer_structured = matches!(
+        chat_req.response_format,
+        Some(chat::ResponseFormat::JsonSchema(_)) | Some(chat::ResponseFormat::JsonObject(_))
+    ) && !provider.stream_structured_output;
+
+    if buffer_structured {
+        stream_structured_buffered(
+            state,
+            &provider,
+            socket,
+            chat_req,
+            model,
+            rid,
+            full_input_messages,
+            response_tools,
+            stored_custom_names,
+            custom_names,
+            input_char_scale,
+        )
+        .await;
+        return;
+    }
+
     let url = format!("{}/chat/completions", provider.base_url);
     let request = state
         .http_client()
@@ -610,6 +638,134 @@ async fn handle_compaction_trigger(
     if let Some(store_messages) = store_messages {
         state.store().put(rid, store_messages).await;
     }
+}
+
+/// Send a server-error event over the WebSocket.
+async fn send_ws_error(socket: &mut WebSocket, status: u16, message: String) {
+    let ws_err = websocket::ErrorEvent::new(
+        status,
+        Error::TYPE_SERVER_ERROR,
+        Error::CODE_SERVER_ERROR,
+        message,
+    );
+    super::send(socket, &ws_err.to_json_string()).await;
+}
+
+/// Buffered structured-output path: fetch the reply non-streamed (the upstream
+/// rejects `stream: true` with a structured `response_format`), then replay the
+/// full response as the canonical WebSocket lifecycle. Mirrors the HTTP
+/// `handle_streaming_structured` and reuses `response_to_stream_events`.
+#[allow(clippy::too_many_arguments)]
+async fn stream_structured_buffered(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    socket: &mut WebSocket,
+    mut chat_req: chat::Request,
+    model: String,
+    rid: String,
+    mut full_input_messages: Vec<MessageRequest>,
+    response_tools: Vec<chat::ToolRequest>,
+    stored_custom_names: std::collections::HashSet<String>,
+    custom_names: std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
+) {
+    chat_req.stream = Some(false);
+    chat_req.stream_options = None;
+
+    let url = format!("{}/chat/completions", provider.base_url);
+    let request = state
+        .http_client()
+        .post(&url)
+        .timeout(provider.timeout)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .header("Content-Type", "application/json");
+    let request = if provider.rewrite.chat_out.is_empty() {
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&chat_req).unwrap_or_default()
+        );
+        request.json(&chat_req)
+    } else {
+        let mut body = match serde_json::to_value(&chat_req) {
+            Ok(body) => body,
+            Err(e) => return send_ws_error(socket, 500, e.to_string()).await,
+        };
+        if let Err(message) = crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out) {
+            return send_ws_error(socket, 500, message).await;
+        }
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&body).unwrap_or_default()
+        );
+        request.json(&body)
+    };
+
+    let http_resp = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return send_ws_error(socket, 502, format!("Upstream error: {e}")).await,
+    };
+    if !http_resp.status().is_success() {
+        let status = http_resp.status().as_u16();
+        let body = http_resp.text().await.unwrap_or_default();
+        return send_ws_error(socket, status, format!("Upstream error:  {body}")).await;
+    }
+    let body = match http_resp.text().await {
+        Ok(b) => b,
+        Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+    };
+
+    let chat_resp: chat::Completion = if provider.rewrite.chat_in.is_empty() {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        }
+    } else {
+        let mut v: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        };
+        if let Err(message) = crate::rewrite::apply_rewrite(&mut v, &provider.rewrite.chat_in) {
+            return send_ws_error(socket, 500, message).await;
+        }
+        match serde_json::from_value(v) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        }
+    };
+
+    let mut resp = crate::convert::chat_to_responses(chat_resp, model, state.compact_key());
+    resp.id = rid.clone();
+    crate::handlers::apply_input_char_scale(resp.usage.as_mut(), input_char_scale);
+    crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
+
+    // Compute persisted history before `resp` is consumed by event synthesis.
+    let stored_output = crate::convert::items_to_chat_messages(
+        &crate::convert::output_to_input_items(&resp.output),
+        state,
+    );
+
+    for event in crate::handlers::response_to_stream_events(resp) {
+        match prepare_stream_event(event, &provider.rewrite.responses_out) {
+            Ok(prepared) => {
+                let msg = prepared.body.to_string();
+                tracing::debug!("WS send: {msg}");
+                if socket.send(WsMsg::Text(msg.into())).await.is_err() {
+                    tracing::info!("WS send failed");
+                    return;
+                }
+            }
+            Err(message) => return send_ws_error(socket, 500, message).await,
+        }
+    }
+
+    // Persist history so `previous_response_id` chains resolve (see the
+    // streaming path's note); independent of the client `store` flag.
+    full_input_messages.extend(stored_output);
+    state
+        .store()
+        .put_tools(rid.clone(), response_tools, stored_custom_names)
+        .await;
+    state.store().put(rid, full_input_messages).await;
 }
 
 #[cfg(test)]

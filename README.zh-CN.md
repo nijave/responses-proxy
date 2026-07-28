@@ -105,6 +105,9 @@ models:
       base-url: https://api.deepseek.com
       api-key: $DEEPSEEK_API_KEY
     model: deepseek-v4-flash
+    # 若上游拒绝 `stream: true` 与结构化 `response_format` 组合，设为 false；
+    # 代理会以非流式方式获取响应，再作为 SSE 回放给客户端。默认 true（原样透传流式）。
+    # stream-structured-output: true
 ```
 
 ### Rewrite 规则
@@ -214,6 +217,8 @@ rewrites:
 ## 流式传输
 
 在 Responses API 请求中设置 `"stream": true`。代理会将 Chat API SSE 数据块转换为 Responses API 流式事件（`response.created` → `response.output_text.delta` → `response.completed`）。Tool call 增量数据跨 chunk 累积后在最终事件中完整输出。
+
+**结构化输出的流式传输。** 部分网关会拒绝 `stream: true` 与结构化 `response_format`（`json_schema` / `json_object`）的组合——Codex 的 Guardian 审查正是这种请求。为受影响的模型设置 `stream-structured-output: false`，代理便会以非流式方式获取该响应，再作为单次 SSE 回放给客户端（`response.created` → `response.output_text.delta` → `response.completed`）。对客户端完全透明，而结构化输出本就无法利用流式增量（不完整的 JSON 无法解析）。默认值为 `true`，因此原生支持结构化流式输出的提供方（如 OpenAI）不受影响。
 
 ## 鉴权
 

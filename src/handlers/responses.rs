@@ -222,7 +222,33 @@ pub async fn responses(
         return Ok((StatusCode::ACCEPTED, Json(queued_resp)).into_response());
     }
 
-    if is_stream {
+    // Some upstream gateways reject `stream: true` combined
+    // with a structured `response_format` (json_schema/json_object) — Codex's
+    // Guardian judge hits exactly that. For providers flagged
+    // `stream-structured-output: false`, fetch the response non-streamed and
+    // replay it to the client as SSE. Streaming deltas are useless for
+    // structured output anyway (partial JSON isn't parseable).
+    let buffer_structured = matches!(
+        chat_req.response_format,
+        Some(crate::types::chat::ResponseFormat::JsonSchema(_))
+            | Some(crate::types::chat::ResponseFormat::JsonObject(_))
+    ) && !provider.stream_structured_output;
+
+    if is_stream && buffer_structured {
+        handle_streaming_structured(
+            &state,
+            &provider,
+            chat_req,
+            model,
+            req,
+            full_input_messages,
+            response_tools,
+            custom_names,
+            input_char_scale,
+        )
+        .await
+        .map(|s| s.into_response())
+    } else if is_stream {
         handle_streaming(
             &state,
             &provider,
@@ -711,6 +737,201 @@ async fn handle_streaming(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+// ── Buffered streaming for structured output ─────────────────────────────
+
+/// Streaming path for upstreams that reject `stream: true` combined with a
+/// structured `response_format` (see `buffer_structured` at the dispatcher).
+/// Fetches the reply non-streamed via `execute_upstream_request`, then replays
+/// it to the client as the canonical SSE lifecycle. Store/echo behaviour
+/// mirrors `handle_non_streaming`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_streaming_structured(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    mut chat_req: ChatRequest,
+    model: String,
+    original_req: ResponsesRequest,
+    full_input_messages: Vec<crate::types::chat::MessageRequest>,
+    response_tools: Vec<crate::types::chat::ToolRequest>,
+    custom_names: std::collections::HashSet<String>,
+    input_char_scale: Option<(u64, u64)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Fetch non-streamed — this path exists precisely because the upstream
+    // rejects `stream: true` with a structured response_format.
+    chat_req.stream = Some(false);
+    chat_req.stream_options = None;
+
+    let mut resp = execute_upstream_request(
+        state,
+        provider,
+        chat_req,
+        model,
+        &original_req,
+        &custom_names,
+        input_char_scale,
+    )
+    .await
+    .map_err(|msg| {
+        let err = Error::server_error(msg);
+        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+    })?;
+
+    // Persist to store if store=true (mirrors handle_non_streaming).
+    if original_req.store {
+        let mut store_messages = full_input_messages;
+        let output_inputs = output_to_input_items(&resp.output);
+        store_messages.extend(items_to_chat_messages(&output_inputs, state));
+        state
+            .store()
+            .put_tools(resp.id.clone(), response_tools, custom_names)
+            .await;
+        state.store().put(resp.id.clone(), store_messages).await;
+    }
+
+    // Echo back request metadata and other params.
+    if let Some(ref meta) = original_req.metadata {
+        resp.metadata = Some(meta.clone());
+    }
+    resp.parallel_tool_calls = original_req.parallel_tool_calls;
+
+    // Synthesize the SSE lifecycle from the complete response.
+    let responses_out = provider.rewrite.responses_out.clone();
+    let events = response_to_stream_events(resp);
+
+    // Size the channel to the event count so the inline sends never block
+    // before the receiver stream is returned.
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(events.len() + 1);
+    for event in events {
+        let prepared = crate::types::streaming::prepare_stream_event(event, &responses_out)
+            .map_err(|msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
+        let sse_event = SseEvent::default()
+            .event(prepared.event_type)
+            .json_data(prepared.body)
+            .map_err(|e| {
+                let err = Error::server_error(e.to_string());
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
+        if tx.send(Ok(sse_event)).await.is_err() {
+            break;
+        }
+    }
+    drop(tx);
+
+    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+/// Expand a complete `Response` into the canonical SSE lifecycle event
+/// sequence, so a non-streamed upstream reply can be replayed as streaming.
+/// Shared with the WebSocket handler's buffered-structured path.
+pub(crate) fn response_to_stream_events(
+    resp: crate::types::responses::Response,
+) -> Vec<StreamEvent> {
+    use crate::types::event::{
+        Completed, ContentPart, ContentPartAdded, ContentPartDone, Created, InProgress,
+        OutputItemAdded, OutputItemDone, TextDelta, TextDone,
+    };
+    use crate::types::item::{OutputContentBlock, OutputItem};
+
+    let lifecycle = crate::types::responses::Response {
+        status: ResponseStatus::InProgress,
+        output: vec![],
+        usage: None,
+        ..resp.clone()
+    };
+
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let mut seq: i64 = 0;
+    let mut next = || {
+        let s = seq;
+        seq += 1;
+        s
+    };
+
+    events.push(StreamEvent::Created(Created {
+        response: lifecycle.clone(),
+        sequence_number: next(),
+    }));
+    events.push(StreamEvent::InProgress(InProgress {
+        response: lifecycle,
+        sequence_number: next(),
+    }));
+
+    for (output_index, item) in resp.output.iter().enumerate() {
+        let output_index = output_index as i64;
+        events.push(StreamEvent::OutputItemAdded(OutputItemAdded {
+            item: item.clone(),
+            output_index,
+            sequence_number: next(),
+        }));
+
+        // For a text message, emit the content-part + text lifecycle so clients
+        // reconstructing from deltas still receive the full text.
+        if let OutputItem::Message(msg) = item {
+            let item_id = msg.id.clone();
+            for (content_index, block) in msg.content.iter().enumerate() {
+                let content_index = content_index as i64;
+                if let OutputContentBlock::Text {
+                    text, annotations, ..
+                } = block
+                {
+                    events.push(StreamEvent::ContentPartAdded(ContentPartAdded {
+                        content_index,
+                        item_id: item_id.clone(),
+                        output_index,
+                        part: ContentPart::Text {
+                            text: String::new(),
+                            annotations: vec![],
+                        },
+                        sequence_number: next(),
+                    }));
+                    events.push(StreamEvent::TextDelta(TextDelta {
+                        content_index,
+                        delta: text.clone(),
+                        item_id: item_id.clone(),
+                        output_index,
+                        sequence_number: next(),
+                        logprobs: None,
+                    }));
+                    events.push(StreamEvent::TextDone(TextDone {
+                        content_index,
+                        item_id: item_id.clone(),
+                        output_index,
+                        sequence_number: next(),
+                        text: text.clone(),
+                        logprobs: None,
+                    }));
+                    events.push(StreamEvent::ContentPartDone(ContentPartDone {
+                        content_index,
+                        item_id: item_id.clone(),
+                        output_index,
+                        part: ContentPart::Text {
+                            text: text.clone(),
+                            annotations: annotations.clone(),
+                        },
+                        sequence_number: next(),
+                    }));
+                }
+            }
+        }
+
+        events.push(StreamEvent::OutputItemDone(OutputItemDone {
+            item: item.clone(),
+            output_index,
+            sequence_number: next(),
+        }));
+    }
+
+    events.push(StreamEvent::Completed(Completed {
+        response: resp,
+        sequence_number: next(),
+    }));
+
+    events
 }
 
 // ── Remote compaction v2 trigger ─────────────────────────────────────────
