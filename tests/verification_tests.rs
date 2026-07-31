@@ -1254,6 +1254,36 @@ async fn s13_streaming_output_index_with_reasoning() {
     assert_eq!(state.tool_calls[0].output_index, 2);
 }
 
+// ── Scenario 13b: Preamble text preserved when a tool call follows ───
+// Regression: a text→tool_calls transition moves the assistant message into
+// `completed_items` and clears `accumulated_text`. `to_response_message`
+// (WebSocket persistence) must recover the preamble from `completed_items`,
+// otherwise the stored history drops it and the model re-acknowledges the
+// user's message on every subsequent tool-call turn.
+#[tokio::test]
+async fn s13b_preamble_text_survives_tool_call_transition() {
+    let mut state = StreamState::new("resp_test".into(), "msg_test".into(), "test".into());
+
+    // Chunk 1: assistant preamble text only.
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"On it."}}]}"#).unwrap(),
+    );
+    // Chunk 2: tool call with no content — triggers the text→tool_calls transition.
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#).unwrap(),
+    );
+
+    // The transition cleared accumulated_text and stored the message.
+    assert!(state.accumulated_text.is_empty());
+
+    // Persisted message must still carry the preamble AND the tool call.
+    let msg = state.to_response_message();
+    assert_eq!(msg.content.as_deref(), Some("On it."));
+    assert!(msg.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()));
+}
+
 // ── Scenario 14: Streaming in_progress after created ─────────────────
 
 #[tokio::test]

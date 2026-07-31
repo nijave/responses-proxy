@@ -126,6 +126,25 @@ impl StreamState {
         parts.join("\n")
     }
 
+    /// Recover assistant message text/refusal closed mid-stream. A text→tool_calls
+    /// transition pushes the message into `completed_items` and clears
+    /// `accumulated_text`; mirror the reasoning/tool_call recovery so persisted
+    /// history keeps the assistant's preamble instead of dropping it.
+    fn extract_message_from_completed(&self) -> (String, String) {
+        let (mut text, mut refusal) = (String::new(), String::new());
+        for item in &self.completed_items {
+            if let OutputItem::Message(m) = item {
+                for block in &m.content {
+                    match block {
+                        OutputContentBlock::Text { text: t, .. } => text.push_str(t),
+                        OutputContentBlock::Refusal { refusal: r } => refusal.push_str(r),
+                    }
+                }
+            }
+        }
+        (text, refusal)
+    }
+
     fn extract_tool_calls_from_completed(completed: &[OutputItem]) -> Vec<chat::ToolCallResponse> {
         completed
             .iter()
@@ -150,13 +169,14 @@ impl StreamState {
     }
 
     pub fn to_response_message(&self) -> chat::ResponseMessage {
-        let (content, refusal) = if self.has_refusal {
-            (None, Some(self.accumulated_text.clone()))
-        } else if self.accumulated_text.is_empty() {
-            (None, None)
+        let (mut text, mut refusal) = self.extract_message_from_completed();
+        if self.has_refusal {
+            refusal.push_str(&self.accumulated_text);
         } else {
-            (Some(self.accumulated_text.clone()), None)
-        };
+            text.push_str(&self.accumulated_text);
+        }
+        let content = (!text.is_empty()).then_some(text);
+        let refusal = (!refusal.is_empty()).then_some(refusal);
         // Gather tool calls: open ones + any closed mid-stream
         let mut tool_calls: Vec<chat::ToolCallResponse> = Vec::new();
         for tc in &self.tool_calls {
