@@ -20,6 +20,34 @@ pub fn build_chat_request(
         .json(body)
 }
 
+/// Best-effort fetch of the upstream-advertised context window (in tokens) for
+/// `provider.model`, read from `GET {base_url}/models`'s `data[].context_length`.
+/// Returns `None` on any failure (network, non-2xx, parse, model absent) so the
+/// caller can fall back to a config override or Codex's bundled default rather
+/// than the request failing.
+pub(crate) async fn fetch_context_window(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+) -> Option<i64> {
+    let url = format!("{}/models", provider.base_url);
+    let resp = client
+        .get(&url)
+        .timeout(provider.timeout)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let data = body.get("data")?.as_array()?;
+    data.iter()
+        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(provider.model.as_str()))
+        .and_then(|m| m.get("context_length"))
+        .and_then(serde_json::Value::as_i64)
+}
+
 /// Build a POST request from a typed ChatRequest, applying `chat_out` rewrite if configured.
 pub fn build_typed_chat_request(
     client: &reqwest::Client,
@@ -128,6 +156,30 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 11);
         assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, 13);
+    }
+
+    #[test]
+    fn captures_usage_on_final_non_empty_choices_chunk() {
+        // Some upstreams attach `usage` to the final chunk that still carries a
+        // `finish_reason` choice, not a separate choices-empty chunk. Reading
+        // usage only on the choices-empty path would silently drop it here, and
+        // Codex — which gates auto-compaction on the reported total_tokens —
+        // would never compact.
+        let mut ss = StreamState::new(String::new(), String::new(), String::new());
+        let ci = empty();
+        let co = empty();
+        let sse = concat!(
+            "data: {\"id\":\"x\",\"model\":\"m\",\"created\":7,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"x\",\"model\":\"m\",\"created\":7,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3,\"total_tokens\":45}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut buf = sse.to_string();
+        drain_sse_buffer(&mut buf, &mut ss, &ci, &co).unwrap();
+
+        assert_eq!(ss.accumulated_text, "Hi");
+        let usage = ss.usage.expect("usage captured from final non-empty chunk");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.total_tokens, 45);
     }
 
     #[test]

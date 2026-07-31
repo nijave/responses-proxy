@@ -47,25 +47,27 @@ pub(crate) fn content_chars(messages: &[chat::MessageRequest]) -> usize {
     messages.iter().map(count_message_chars).sum()
 }
 
-/// When history was truncated before forwarding, the upstream counts only the
-/// shrunken input, so its `usage` under-reports the true context size. Codex
-/// gates auto-compaction on the server-reported `total_tokens`, so we scale the
-/// upstream's real `input_tokens` back up by the `(full_chars, sent_chars)`
-/// ratio — calibrating against the upstream's own tokenizer rather than a
-/// hardcoded chars-per-token constant — and recompute `total`. No-op when
-/// `scale` is `None` (nothing was truncated), usage is absent, or the ratio
-/// wouldn't grow the count.
+/// Scale the upstream `usage` up to reflect the true pre-truncation history
+/// size, in place. Codex gates its client-side auto-compaction solely on the
+/// server-reported `total_tokens`, so when we shrink the forwarded input the
+/// upstream counts only the shrunken payload and under-reports the real context
+/// size. `scale = (full_chars, sent_chars)` grows `input_tokens` back up by that
+/// ratio (calibrated against the upstream's own tokenizer rather than a
+/// hardcoded chars-per-token constant); `total_tokens` is kept in sync so
+/// `total == input + output`. No-op when `scale` is `None`, usage is absent, or
+/// nothing was truncated (`full <= sent`, or `sent == 0`).
 ///
-/// If this ratio proves inaccurate for some languages we can switch to a real
-/// tokenizer such as tiktoken-rs.
+/// If the scale ratio proves inaccurate for some languages we can switch to a
+/// real tokenizer such as tiktoken-rs.
 pub(crate) fn apply_input_char_scale(
     usage: Option<&mut crate::types::responses::Usage>,
     scale: Option<(u64, u64)>,
 ) {
-    if let (Some(u), Some((full_chars, sent_chars))) = (usage, scale) {
-        if sent_chars == 0 || full_chars <= sent_chars {
-            return;
-        }
+    let Some(u) = usage else { return };
+    if let Some((full_chars, sent_chars)) = scale
+        && sent_chars != 0
+        && full_chars > sent_chars
+    {
         let scaled =
             ((u.input_tokens as f64) * (full_chars as f64) / (sent_chars as f64)).round() as i64;
         u.input_tokens = scaled;

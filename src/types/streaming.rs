@@ -59,12 +59,12 @@ pub struct StreamState {
     /// as `function` calls; for these names the client-facing events are emitted
     /// as `custom_tool_call` instead (see [`emit_tool_call_deltas`]).
     pub custom_tool_names: HashSet<String>,
-    /// `(full_chars, sent_chars)` content-character counts from before/after
-    /// truncation. When set, the upstream's real `input_tokens` is scaled up by
-    /// `full/sent` so the reported context size tracks the upstream tokenizer
-    /// (Codex gates auto-compaction on it). `None` leaves usage untouched. See
-    /// `handlers::apply_input_char_scale`.
-    pub input_char_scale: Option<(u64, u64)>,
+    /// Truncation char-scale `(full_chars, sent_chars)` applied to the reported
+    /// `usage` before it reaches Codex. Codex gates auto-compaction on the
+    /// reported `total_tokens`, so when history is truncated we scale the count
+    /// back up to the true pre-truncation size. `None` leaves usage untouched.
+    /// See `handlers::apply_input_char_scale`.
+    pub(crate) truncation_scale: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -280,11 +280,16 @@ pub fn process_chunk_value(
         state.created = chunk.created;
     }
 
-    // Usage-only chunk (choices empty, usage present) — store usage, no events
+    // Capture usage whenever the provider includes it. The OpenAI reference
+    // sends it on a separate choices-empty chunk, but some providers attach it
+    // to the final chunk that still carries a finish_reason choice — reading it
+    // only on the choices-empty path would silently drop it there.
+    if let Some(ref usage) = chunk.usage {
+        state.usage = Some(usage.clone());
+    }
+
+    // Usage-only chunk (no choices) — nothing further to emit.
     if chunk.choices.is_empty() {
-        if let Some(ref usage) = chunk.usage {
-            state.usage = Some(usage.clone());
-        }
         return None;
     }
 
@@ -816,11 +821,18 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
 
     if let Some(ref usage) = state.usage {
         let mut u = super::responses::Usage::from(usage.clone());
-        // Scale the upstream's real input_tokens back up by the full/sent
-        // character ratio so Codex's auto-compaction threshold, which keys off
-        // server-reported total_tokens, fires on time even when we truncated.
-        crate::handlers::apply_input_char_scale(Some(&mut u), state.input_char_scale);
+        // Scale input_tokens up for truncation before Codex sees it: Codex keys
+        // its client-side auto-compaction off the server-reported total_tokens.
+        crate::handlers::apply_input_char_scale(Some(&mut u), state.truncation_scale);
+        tracing::debug!(
+            input_tokens = u.input_tokens,
+            total_tokens = u.total_tokens,
+            scale = ?state.truncation_scale,
+            "reported usage"
+        );
         response.usage = Some(u);
+    } else {
+        tracing::debug!("reported usage: none from upstream");
     }
 
     match final_status {

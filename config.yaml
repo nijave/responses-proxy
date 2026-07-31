@@ -92,7 +92,9 @@ models:
     # - replace: if current value matches "if", write set to the current
     #   replace key, then write each optional with entry
     #   With is an ordered map of target path -> JSON value. Use "" as a
-    #   with key to replace the whole body.
+    #   with key to replace the whole body. A with entry can target any path,
+    #   including "model", so a single rule can both clamp a field and route the
+    #   request to a different upstream model (see the reasoning example below).
     #   String "if" values are regex patterns. Use ^...$ for exact matches.
     #
     # The commented example below shows common provider compatibility rewrites.
@@ -112,6 +114,9 @@ models:
     #         - if: "^(high|xhigh)$"
     #           set: max
     #           with:
+    #             # Route the highest reasoning tiers to a stronger upstream
+    #             # model in the same rule that clamps the effort value.
+    #             model: provider/model-pro
     #             thinking:
     #               type: enable
     #         - if: "^(minimal|low|medium)$"
@@ -150,6 +155,28 @@ models:
       # Per-provider timeout in seconds.
       # Optional. Falls back to server.timeout.
       timeout: 60
+
+    # Per-model history controls.
+    # Optional. Omit the whole block to accept the defaults.
+    history:
+      # Total character ceiling for the converted Chat request. When replayed
+      # history exceeds it, the oldest tool outputs are truncated until it fits.
+      # Acts as a backstop; keep it above the compaction point (see
+      # context-window) so Codex compacts before the proxy has to truncate.
+      # Optional. Default: unlimited.
+      # max-input-chars: 1500000
+
+      # Maximum number of messages in the converted Chat request.
+      # Optional. Default: 1000.
+      # max-input-messages: 1000
+
+      # Context window (tokens) advertised to Codex via /v1/models. Codex keys
+      # its client-side auto-compaction off this size (it compacts at ~90% of
+      # it). Setting this OVERRIDES whatever the upstream advertises; leaving it
+      # unset trusts the upstream's own context length, and if the upstream
+      # doesn't report one, Codex falls back to its bundled default.
+      # Optional. Default: trust the upstream.
+      # context-window: 400000
 
   codex-auto-review:
     # Example of exposing another logical model backed by a different

@@ -71,7 +71,7 @@ pub async fn responses(
     let endpoint = format!("{}/chat/completions", provider.base_url);
 
     // Build chat request (responses_to_chat fetches history + handles instructions)
-    let (chat_req, full_input_messages, input_char_scale) = {
+    let (chat_req, full_input_messages, truncation_scale) = {
         let mut cr = responses_to_chat(req.clone(), &state)
             .await
             .map_err(|unsupported| {
@@ -113,10 +113,10 @@ pub async fn responses(
             }
         }
         let sent_chars = super::input_tokens::content_chars(&cr.messages);
-        let input_char_scale =
+        let truncation_scale =
             (dropped > 0 || shrunk > 0).then_some((full_chars as u64, sent_chars as u64));
         let input_msgs = cr.messages.clone();
-        (cr, input_msgs, input_char_scale)
+        (cr, input_msgs, truncation_scale)
     };
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
@@ -133,12 +133,6 @@ pub async fn responses(
     )
     .await;
     let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
-    // Codex sends its auto-compaction threshold here; log it to confirm on live
-    // runs that the client drives compaction off our reported usage.
-    let compact_threshold = req
-        .context_management
-        .as_ref()
-        .and_then(|cm| cm.iter().find_map(|c| c.compact_threshold));
     tracing::info!(
         model = %model,
         upstream = %provider_model,
@@ -147,8 +141,7 @@ pub async fn responses(
         tool_output_chars,
         stream = is_stream,
         endpoint = %endpoint,
-        input_char_scale = ?input_char_scale,
-        compact_threshold = ?compact_threshold,
+        truncation_scale = ?truncation_scale,
         "Forwarding request"
     );
 
@@ -190,7 +183,7 @@ pub async fn responses(
                 bg_model,
                 &bg_req,
                 &bg_custom_names,
-                input_char_scale,
+                truncation_scale,
             )
             .await;
 
@@ -244,7 +237,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
-            input_char_scale,
+            truncation_scale,
         )
         .await
         .map(|s| s.into_response())
@@ -258,7 +251,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
-            input_char_scale,
+            truncation_scale,
         )
         .await
         .map(|s| s.into_response())
@@ -272,7 +265,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
-            input_char_scale,
+            truncation_scale,
         )
         .await
         .map(|j| j.into_response())
@@ -336,7 +329,7 @@ async fn execute_upstream_request(
     model: String,
     original_req: &ResponsesRequest,
     custom_names: &std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 ) -> Result<crate::types::responses::Response, String> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -384,7 +377,7 @@ async fn execute_upstream_request(
     };
 
     let mut resp = chat_to_responses(chat_resp, model, state.compact_key());
-    super::input_tokens::apply_input_char_scale(resp.usage.as_mut(), input_char_scale);
+    super::input_tokens::apply_input_char_scale(resp.usage.as_mut(), truncation_scale);
 
     // gpt-5.6 code-mode: map function_call output items back to the
     // custom_tool_call shape Codex expects (no-op for models below 5.6).
@@ -407,7 +400,7 @@ async fn handle_non_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let mut resp = execute_upstream_request(
         state,
@@ -416,7 +409,7 @@ async fn handle_non_streaming(
         model,
         &original_req,
         &custom_names,
-        input_char_scale,
+        truncation_scale,
     )
     .await
     .map_err(|msg| {
@@ -477,7 +470,7 @@ async fn handle_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -548,7 +541,7 @@ async fn handle_streaming(
             .as_secs() as i64;
         ss.has_started = true;
         ss.compact_key = bg_state.compact_key().copied();
-        ss.input_char_scale = input_char_scale;
+        ss.truncation_scale = truncation_scale;
 
         let start_response =
             build_stream_lifecycle_response(&rid, &model, ss.created, ResponseStatus::InProgress);
@@ -756,7 +749,7 @@ async fn handle_streaming_structured(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Fetch non-streamed — this path exists precisely because the upstream
     // rejects `stream: true` with a structured response_format.
@@ -770,7 +763,7 @@ async fn handle_streaming_structured(
         model,
         &original_req,
         &custom_names,
-        input_char_scale,
+        truncation_scale,
     )
     .await
     .map_err(|msg| {

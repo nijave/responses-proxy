@@ -45,6 +45,7 @@ fn test_state_with_rewrite(
             max_input_chars: None,
             max_input_messages: 1000,
             stream_structured_output: true,
+            context_window: None,
         },
     );
 

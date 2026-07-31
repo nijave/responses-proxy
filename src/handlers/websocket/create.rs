@@ -154,8 +154,16 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         }
     }
     let sent_chars = crate::handlers::input_tokens::content_chars(&chat_req.messages);
-    let input_char_scale =
+    let truncation_scale =
         (dropped > 0 || shrunk > 0).then_some((full_chars as u64, sent_chars as u64));
+    tracing::info!(
+        model = %model,
+        upstream = %provider.model,
+        messages = chat_req.messages.len(),
+        transport = "ws",
+        truncation_scale = ?truncation_scale,
+        "Forwarding request"
+    );
     let mut full_input_messages = chat_req.messages.clone();
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
@@ -234,7 +242,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             response_tools,
             stored_custom_names,
             custom_names,
-            input_char_scale,
+            truncation_scale,
         )
         .await;
         return;
@@ -361,7 +369,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         now,
         compact_key: state.compact_key(),
         custom_tool_names: custom_names,
-        input_char_scale,
+        truncation_scale,
     };
     let (response_msg, cancelled, stream_events) =
         run_stream(socket, stream_resp, stream_context, cancel_rx).await;
@@ -410,7 +418,7 @@ struct WsStreamContext<'a> {
     now: i64,
     compact_key: Option<&'a [u8; 32]>,
     custom_tool_names: std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 }
 
 async fn run_stream(
@@ -429,7 +437,7 @@ async fn run_stream(
     ss.created = context.now;
     ss.compact_key = context.compact_key.copied();
     ss.custom_tool_names = context.custom_tool_names;
-    ss.input_char_scale = context.input_char_scale;
+    ss.truncation_scale = context.truncation_scale;
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
     let mut collected_events: Vec<StreamEvent> = Vec::new();
@@ -667,7 +675,7 @@ async fn stream_structured_buffered(
     response_tools: Vec<chat::ToolRequest>,
     stored_custom_names: std::collections::HashSet<String>,
     custom_names: std::collections::HashSet<String>,
-    input_char_scale: Option<(u64, u64)>,
+    truncation_scale: Option<(u64, u64)>,
 ) {
     chat_req.stream = Some(false);
     chat_req.stream_options = None;
@@ -735,7 +743,7 @@ async fn stream_structured_buffered(
 
     let mut resp = crate::convert::chat_to_responses(chat_resp, model, state.compact_key());
     resp.id = rid.clone();
-    crate::handlers::apply_input_char_scale(resp.usage.as_mut(), input_char_scale);
+    crate::handlers::apply_input_char_scale(resp.usage.as_mut(), truncation_scale);
     crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
 
     // Compute persisted history before `resp` is consumed by event synthesis.

@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -10,6 +10,7 @@ use clap::Parser;
 use responses_proxy::app;
 use responses_proxy::config;
 use responses_proxy::handlers;
+use std::collections::HashMap;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
@@ -118,7 +119,15 @@ async fn health_check() -> &'static str {
 
 async fn list_models(
     State(state): State<app::State>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Codex appends `?client_version=...` and reads its context window from a
+    // proprietary `{"models":[...]}` schema; plain OpenAI clients get the
+    // standard `{"object":"list","data":[...]}` shape.
+    if params.contains_key("client_version") {
+        return Ok(Json(codex_model_list(&state).await));
+    }
+
     let data: Vec<serde_json::Value> = state
         .config()
         .models
@@ -130,4 +139,39 @@ async fn list_models(
         })
         .collect();
     Ok(Json(serde_json::json!({"object": "list", "data": data})))
+}
+
+/// Build Codex's proprietary model-list response. Codex ignores the OpenAI
+/// shape, so this mirrors its `ModelsResponse`/`ModelInfo` schema and carries
+/// the per-model `context_window` (config override → upstream value → null,
+/// where null lets Codex fall back to its bundled default). Every required
+/// field must be present or Codex silently discards the entry.
+async fn codex_model_list(state: &app::State) -> serde_json::Value {
+    let mut models = Vec::new();
+    for (name, provider) in &state.config().models {
+        let context_window = state.resolve_context_window(provider).await;
+        models.push(serde_json::json!({
+            "slug": name,
+            "display_name": name,
+            "description": null,
+            "supported_reasoning_levels": [{"effort": "medium", "description": "Balanced"}],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "availability_nux": null,
+            "upgrade": null,
+            "base_instructions": "You are Codex, an agent based on GPT-5.",
+            "support_verbosity": true,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "supports_parallel_tool_calls": true,
+            "context_window": context_window,
+            "max_context_window": context_window,
+            "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+        }));
+    }
+    serde_json::json!({ "models": models })
 }

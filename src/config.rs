@@ -120,6 +120,13 @@ pub struct HistoryConfig {
     pub max_input_chars: Option<usize>,
     #[serde(default = "default_max_input_messages")]
     pub max_input_messages: usize,
+    /// Context window (in tokens) advertised to Codex via `/v1/models`. Codex
+    /// keys its client-side auto-compaction off this size. When set it
+    /// overrides whatever the upstream advertises; when unset the proxy trusts
+    /// the upstream's own context length (or omits it, letting Codex fall back
+    /// to its bundled default).
+    #[serde(default)]
+    pub context_window: Option<i64>,
 }
 
 fn default_max_input_messages() -> usize {
@@ -561,6 +568,9 @@ pub struct ResolvedProvider {
     /// Whether the upstream can stream structured output. When `false`, the
     /// proxy buffers a non-streamed upstream response and replays it as SSE.
     pub stream_structured_output: bool,
+    /// Context window (tokens) to advertise to Codex, overriding the upstream's
+    /// own value. `None` means trust the upstream (or Codex's bundled default).
+    pub context_window: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +645,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
             .map(|h| h.max_input_messages)
             .unwrap_or_else(default_max_input_messages);
         let stream_structured_output = entry.stream_structured_output.unwrap_or(true);
+        let context_window = entry.history.as_ref().and_then(|h| h.context_window);
 
         models.insert(
             logical_name.clone(),
@@ -647,6 +658,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 max_input_chars,
                 max_input_messages,
                 stream_structured_output,
+                context_window,
             },
         );
         model_names.push(logical_name.clone());
