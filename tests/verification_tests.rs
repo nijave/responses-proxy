@@ -46,6 +46,8 @@ fn test_state_with_rewrite(
             max_input_messages: 1000,
             stream_structured_output: true,
             context_window: None,
+            reasoning_levels: vec![responses_proxy::types::ReasoningEffort::Medium],
+            default_reasoning_level: responses_proxy::types::ReasoningEffort::Medium,
         },
     );
 

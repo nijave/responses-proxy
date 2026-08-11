@@ -10,6 +10,7 @@ use clap::Parser;
 use responses_proxy::app;
 use responses_proxy::config;
 use responses_proxy::handlers;
+use responses_proxy::types::ReasoningEffort;
 use std::collections::HashMap;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -150,11 +151,22 @@ async fn codex_model_list(state: &app::State) -> serde_json::Value {
     let mut models = Vec::new();
     for (name, provider) in &state.config().models {
         let context_window = state.resolve_context_window(provider).await;
+        let supported_reasoning_levels: Vec<serde_json::Value> = provider
+            .reasoning_levels
+            .iter()
+            .map(|level| {
+                serde_json::json!({
+                    "effort": level,
+                    "description": reasoning_description(level),
+                })
+            })
+            .collect();
         models.push(serde_json::json!({
             "slug": name,
             "display_name": name,
             "description": null,
-            "supported_reasoning_levels": [{"effort": "medium", "description": "Balanced"}],
+            "default_reasoning_level": &provider.default_reasoning_level,
+            "supported_reasoning_levels": supported_reasoning_levels,
             "shell_type": "shell_command",
             "visibility": "list",
             "supported_in_api": true,
@@ -174,4 +186,18 @@ async fn codex_model_list(state: &app::State) -> serde_json::Value {
         }));
     }
     serde_json::json!({ "models": models })
+}
+
+/// Short UI label Codex shows next to each reasoning tier in its `/model` picker.
+fn reasoning_description(level: &ReasoningEffort) -> &'static str {
+    match level {
+        ReasoningEffort::None => "Off",
+        ReasoningEffort::Minimal => "Minimal",
+        ReasoningEffort::Low => "Fast",
+        ReasoningEffort::Medium => "Balanced",
+        ReasoningEffort::High => "Deep",
+        ReasoningEffort::Xhigh => "Extra deep",
+        ReasoningEffort::Max => "Very deep",
+        ReasoningEffort::Ultra => "Maximum",
+    }
 }

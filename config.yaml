@@ -178,6 +178,29 @@ models:
       # Optional. Default: trust the upstream.
       # context-window: 400000
 
+    # Reasoning tiers advertised to Codex via /v1/models. Codex builds its
+    # `/model` picker verbatim from this ordered list (recent versions no longer
+    # infer the other built-in tiers themselves), so a model that advertises only
+    # one tier shows only that tier. The order given here is the order shown.
+    # Omit this block to advertise the built-in default:
+    #   levels:  low, medium, high, xhigh, max, ultra
+    #   default: medium
+    #
+    # WARNING: that default list includes xhigh/max/ultra. A plain Chat
+    # Completions upstream rejects tiers it does not support (max/ultra typically
+    # exist only on a provider's /v1/messages endpoint). If yours does not accept
+    # them, either narrow "levels" to what it supports, or clamp max/ultra down
+    # with a rewrite (see the reasoning_effort example above).
+    # reasoning:
+    #   # Tier the picker selects by default.
+    #   default: medium
+    #   # Ordered tiers to advertise; order is preserved in the picker.
+    #   levels:
+    #     - low
+    #     - medium
+    #     - high
+    #     - xhigh
+
   codex-auto-review:
     # Example of exposing another logical model backed by a different
     # downstream model on the same provider.
