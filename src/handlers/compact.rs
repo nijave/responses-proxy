@@ -186,11 +186,22 @@ pub(crate) async fn build_compaction_output(
     };
     let created = ss.created;
 
-    let compaction_id = format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let output = build_compaction_item(state.compact_key(), summary_text);
 
-    // If compaction key is configured, encrypt the summary into
-    // `encrypted_content`; otherwise embed it as a plain-text message.
-    let output = if let Some(key) = state.compact_key() {
+    Ok((output, usage, created))
+}
+
+/// Build the `compaction` output item from a summary. Extracted so the id prefix
+/// and the encrypted/plaintext branches are unit-testable without a live
+/// upstream. The item id uses OpenAI's `cmp_` convention — the other minted ids
+/// already use OpenAI's real prefixes (resp_/msg_/rs_/fc_), and a `comp_` outlier
+/// here is rejected by strict Responses backends when a session started on this
+/// proxy is later replayed against them. With a compaction key the summary is
+/// encrypted into `encrypted_content`; otherwise it is embedded as a plain-text
+/// message.
+fn build_compaction_item(compact_key: Option<&[u8; 32]>, summary_text: &str) -> Vec<OutputItem> {
+    let compaction_id = format!("cmp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    if let Some(key) = compact_key {
         let encrypted = crate::crypto::encrypt(key, summary_text);
         vec![OutputItem::Compaction(Compaction {
             id: Some(compaction_id),
@@ -218,7 +229,42 @@ pub(crate) async fn build_compaction_output(
             })],
             created_by: None,
         })]
-    };
+    }
+}
 
-    Ok((output, usage, created))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_item_id_uses_cmp_prefix() {
+        // Plaintext branch (no key): id starts with `cmp_` and the summary is
+        // embedded as a nested message.
+        let out = build_compaction_item(None, "a summary");
+        let OutputItem::Compaction(c) = &out[0] else {
+            panic!("expected compaction item");
+        };
+        assert!(
+            c.id.as_deref().unwrap_or_default().starts_with("cmp_"),
+            "id = {:?}",
+            c.id
+        );
+        assert!(c.encrypted_content.is_none());
+        assert_eq!(c.output.len(), 1);
+    }
+
+    #[test]
+    fn compaction_item_encrypts_with_key() {
+        // Encrypted branch: id still `cmp_`; the summary rides in
+        // encrypted_content and round-trips back to the plaintext.
+        let key = [7u8; 32];
+        let out = build_compaction_item(Some(&key), "secret summary");
+        let OutputItem::Compaction(c) = &out[0] else {
+            panic!("expected compaction item");
+        };
+        assert!(c.id.as_deref().unwrap_or_default().starts_with("cmp_"));
+        assert!(c.output.is_empty());
+        let decrypted = crate::crypto::decrypt(&key, c.encrypted_content.as_ref().unwrap());
+        assert_eq!(decrypted.as_deref(), Some("secret summary"));
+    }
 }
