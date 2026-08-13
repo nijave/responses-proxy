@@ -26,6 +26,52 @@ codex        # 使用 gpt-5.5 模型
 codex review # 使用 codex-auto-review 模型（如已配置）
 ```
 
+### 独立 profile（按会话切换后端）
+
+`openai_base_url` 是全局设置。如果想按会话在代理与其他后端之间切换，可以定义一个
+provider，并用 `codex --profile <name>` 选择对应 profile。
+
+在 `~/.codex/config.toml` 中声明 provider，并禁用全局子代理功能开关：
+
+```toml
+[model_providers.responses_proxy]
+name = "responses-proxy (local)"
+base_url = "http://localhost:3000/v1"
+# wire_api 默认为 "responses"（正是代理所说的协议）；除非在 config.yaml 中启用
+# server.auth.keys，否则无需 env_key。
+
+# gpt-5.6 的托管子代理（multi-agent）运行在该模型的托管运行时中，无法通过 Chat
+# Completions 执行——请禁用它们。这些是全局功能开关，并非 per-profile。
+[features]
+multi_agent = false
+
+[features.multi_agent_v2]
+enabled = false
+```
+
+Codex ≥ 0.134 不再读取内联的 `[profiles.<name>]` 表——请把 profile 放到独立的
+overlay 文件 `~/.codex/<name>.config.toml` 中，使用顶层键（其余设置，包括
+`[model_providers.*]`，都从基础配置继承）。创建 `~/.codex/proxy.config.toml`：
+
+```toml
+model = "gpt-5.6-sol"          # 必须与 config.yaml 中的某个模型键一致
+model_provider = "responses_proxy"
+model_reasoning_effort = "high"
+```
+
+```bash
+codex --profile proxy
+```
+
+> **在会话开始时选定后端——不要在会话中途切换 provider。** 回放的历史携带
+> backend-specific 的 item id，将进行中的会话切换到其他后端会触发 id 前缀拒绝。
+> 在同一 provider 内切换模型（`/model`）则是安全的。
+
+> **多个并行实例**已经通过各自唯一的 response id 天然隔离。若仍想严格隔离缓存，可
+> 通过 `[model_providers.<id>].http_headers = { "x-responses-proxy-namespace" = "alpha" }`
+> 为每个实例设置可选的 `x-responses-proxy-namespace` 头——不同 namespace 使用各自
+> 独立的存储。常规使用无需配置。
+
 ## 工作原理
 
 ```

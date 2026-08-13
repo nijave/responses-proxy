@@ -26,6 +26,58 @@ codex        # uses gpt-5.5 model
 codex review # uses codex-auto-review model (if configured)
 ```
 
+### Dedicated profile (switch backends per session)
+
+`openai_base_url` is global. To flip between the proxy and another backend
+per session instead, define a provider and select a profile with
+`codex --profile <name>`.
+
+In `~/.codex/config.toml`, declare the provider and disable the global
+sub-agent feature flags:
+
+```toml
+[model_providers.responses_proxy]
+name = "responses-proxy (local)"
+base_url = "http://localhost:3000/v1"
+# wire_api defaults to "responses" (what the proxy speaks); no env_key needed
+# unless you enable server.auth.keys in config.yaml.
+
+# gpt-5.6 hosted sub-agents (multi-agent) run in the model's hosted runtime and
+# are not executable over Chat Completions — disable them. These are GLOBAL
+# feature flags, not per-profile.
+[features]
+multi_agent = false
+
+[features.multi_agent_v2]
+enabled = false
+```
+
+Codex ≥ 0.134 no longer reads inline `[profiles.<name>]` tables — put the
+profile in its own overlay file at `~/.codex/<name>.config.toml` with top-level
+keys (it inherits everything else, including `[model_providers.*]`, from the
+base config). Create `~/.codex/proxy.config.toml`:
+
+```toml
+model = "gpt-5.6-sol"          # must match a model key in config.yaml
+model_provider = "responses_proxy"
+model_reasoning_effort = "high"
+```
+
+```bash
+codex --profile proxy
+```
+
+> **Pick your backend at the start of a session — don't switch providers
+> mid-session.** The replayed history carries backend-specific item ids, so
+> moving a live session to a different backend triggers id-prefix rejections.
+> Switching models *within* a provider (`/model`) is fine.
+
+> **Multiple parallel instances** are already isolated by their unique response
+> ids. If you want strict cache separation regardless, set the optional
+> `x-responses-proxy-namespace` header per instance via
+> `[model_providers.<id>].http_headers = { "x-responses-proxy-namespace" = "alpha" }`
+> — different namespaces get separate stores. Not needed in normal use.
+
 ## How It Works
 
 ```
