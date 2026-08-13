@@ -81,7 +81,18 @@ pub async fn responses_to_chat(
     let instructions = std::mem::take(&mut req.instructions).filter(|i| !i.is_empty());
 
     let prev_messages: Vec<chat::MessageRequest> = match req.previous_response_id {
-        Some(ref prev_id) => state.store().get(prev_id).await.unwrap_or_default(),
+        Some(ref prev_id) => {
+            let restored = state.store().get(prev_id).await.unwrap_or_default();
+            // Diagnostic for cross-session investigations: the resolved id
+            // (which carries any store namespace) and how much history it
+            // restored. Two independent sessions must never share a prev_id.
+            tracing::debug!(
+                prev_id = %prev_id,
+                restored_messages = restored.len(),
+                "resolved previous_response_id history"
+            );
+            restored
+        }
         None => vec![],
     };
 

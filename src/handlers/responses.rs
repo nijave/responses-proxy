@@ -21,8 +21,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// POST /v1/responses — handles both streaming and non-streaming responses.
 pub async fn responses(
     State(state): State<crate::app::State>,
+    headers: axum::http::HeaderMap,
     super::json::ResponsesJson(mut req): super::json::ResponsesJson<ResponsesRequest>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // Optional per-instance store namespace (default empty = shared behavior).
+    let ns = super::namespace_from_headers(&headers);
     let provider = state
         .config()
         .models
@@ -62,7 +65,7 @@ pub async fn responses(
         .iter()
         .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
     {
-        return handle_compaction_trigger(&state, &provider, req).await;
+        return handle_compaction_trigger(&state, &provider, req, &ns).await;
     }
 
     let model = req.model.clone();
@@ -147,7 +150,10 @@ pub async fn responses(
 
     // Handle background mode: return queued status immediately, process in background
     if req.background && !is_stream {
-        let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let response_id = crate::store::namespaced_id(
+            &ns,
+            &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+        );
         let queued_resp = crate::types::responses::Response {
             id: response_id.clone(),
             status: ResponseStatus::Queued,
@@ -238,6 +244,7 @@ pub async fn responses(
             response_tools,
             custom_names,
             truncation_scale,
+            &ns,
         )
         .await
         .map(|s| s.into_response())
@@ -252,6 +259,7 @@ pub async fn responses(
             response_tools,
             custom_names,
             truncation_scale,
+            &ns,
         )
         .await
         .map(|s| s.into_response())
@@ -266,6 +274,7 @@ pub async fn responses(
             response_tools,
             custom_names,
             truncation_scale,
+            &ns,
         )
         .await
         .map(|j| j.into_response())
@@ -401,6 +410,7 @@ async fn handle_non_streaming(
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
     truncation_scale: Option<(u64, u64)>,
+    ns: &str,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let mut resp = execute_upstream_request(
         state,
@@ -416,6 +426,10 @@ async fn handle_non_streaming(
         let err = Error::server_error(msg);
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
+
+    // Namespace the response id so its store entry (and the id Codex echoes as
+    // previous_response_id) is isolated per instance. No-op when ns is empty.
+    resp.id = crate::store::namespaced_id(ns, &resp.id);
 
     // Persist to store if store=true (default)
     if original_req.store {
@@ -471,6 +485,7 @@ async fn handle_streaming(
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
     truncation_scale: Option<(u64, u64)>,
+    ns: &str,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let url = format!("{}/chat/completions", provider.base_url);
 
@@ -512,7 +527,10 @@ async fn handle_streaming(
 
     // SSE → mpsc channel so we can stream to the client
     let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let rid = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
 
     let mut bytes = response.bytes_stream();
@@ -750,6 +768,7 @@ async fn handle_streaming_structured(
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
     truncation_scale: Option<(u64, u64)>,
+    ns: &str,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Fetch non-streamed — this path exists precisely because the upstream
     // rejects `stream: true` with a structured response_format.
@@ -770,6 +789,8 @@ async fn handle_streaming_structured(
         let err = Error::server_error(msg);
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
+
+    resp.id = crate::store::namespaced_id(ns, &resp.id);
 
     // Persist to store if store=true (mirrors handle_non_streaming).
     if original_req.store {
@@ -938,6 +959,7 @@ async fn handle_compaction_trigger(
     state: &crate::app::State,
     provider: &crate::config::ResolvedProvider,
     req: ResponsesRequest,
+    ns: &str,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     // Codex replays the full history in `input` alongside the trigger
     // (store:false), so the request itself is the summary source.
@@ -956,7 +978,10 @@ async fn handle_compaction_trigger(
     )
     .await?;
 
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let response_id = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mut resp = crate::types::responses::Response {
         id: response_id.clone(),
         model: req.model.clone(),

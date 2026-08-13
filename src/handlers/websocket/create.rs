@@ -23,7 +23,12 @@ fn ws_response(rid: &str, model: &str, now: i64, status: ResponseStatus) -> Resp
 }
 
 /// Handle a `response.create` event: parse, forward to upstream, stream back results.
-pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mut req: Request) {
+pub(super) async fn handle(
+    state: &crate::app::State,
+    socket: &mut WebSocket,
+    mut req: Request,
+    ns: &str,
+) {
     tracing::debug!("input items {}", req.input.len());
 
     let provider = match state.config().models.get(&req.model) {
@@ -90,14 +95,17 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         .iter()
         .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
     {
-        handle_compaction_trigger(state, &provider, socket, req).await;
+        handle_compaction_trigger(state, &provider, socket, req, ns).await;
         return;
     }
 
     let model = req.model.clone();
     let generate = req.generate;
 
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let rid = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
 
     // gpt-5.6 code-mode: names Codex declared as custom tools (computed before
@@ -527,6 +535,7 @@ async fn handle_compaction_trigger(
     provider: &crate::config::ResolvedProvider,
     socket: &mut WebSocket,
     req: Request,
+    ns: &str,
 ) {
     // Codex replays the full history in `input` alongside the trigger
     // (store:false), so the request itself is the summary source.
@@ -565,7 +574,10 @@ async fn handle_compaction_trigger(
         }
     };
 
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let rid = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mut resp = Response {
         id: rid.clone(),
         model: req.model.clone(),
