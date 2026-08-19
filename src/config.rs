@@ -113,6 +113,14 @@ pub struct ModelEntry {
     /// Defaults to `true` (pass streaming through unchanged).
     #[serde(default, rename = "stream-structured-output")]
     pub stream_structured_output: Option<bool>,
+    /// Maximum number of tools forwarded to the upstream in a single request.
+    /// Some gateways reject requests carrying more than a fixed number of tools;
+    /// Codex code mode can flatten a large MCP/app-tool registry into hundreds of
+    /// functions, so cap it here. When the converted tool list exceeds this, the
+    /// leading tools (Codex lists its core coding tools first) are kept and the
+    /// overflow is dropped. `0` (the default) disables the cap.
+    #[serde(default, rename = "max-tools")]
+    pub max_tools: usize,
 }
 
 /// Per-model history controls. `max-input-chars` caps the total size of the
@@ -612,6 +620,8 @@ pub struct ResolvedProvider {
     pub max_input_chars: Option<usize>,
     /// Maximum number of messages in the converted Chat request. 0 = unlimited.
     pub max_input_messages: usize,
+    /// Maximum number of tools forwarded to the upstream. `0` = no cap.
+    pub max_tools: usize,
     /// Whether the upstream can stream structured output. When `false`, the
     /// proxy buffers a non-streamed upstream response and replays it as SSE.
     pub stream_structured_output: bool,
@@ -710,6 +720,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 rewrite,
                 max_input_chars,
                 max_input_messages,
+                max_tools: entry.max_tools,
                 stream_structured_output,
                 context_window,
                 reasoning_levels,

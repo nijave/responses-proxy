@@ -74,7 +74,7 @@ pub async fn responses(
     let endpoint = format!("{}/chat/completions", provider.base_url);
 
     // Build chat request (responses_to_chat fetches history + handles instructions)
-    let (chat_req, full_input_messages, truncation_scale) = {
+    let (mut chat_req, full_input_messages, truncation_scale) = {
         let mut cr = responses_to_chat(req.clone(), &state)
             .await
             .map_err(|unsupported| {
@@ -121,6 +121,23 @@ pub async fn responses(
         let input_msgs = cr.messages.clone();
         (cr, input_msgs, truncation_scale)
     };
+    // Cap the tool list before caching/forwarding: some gateways reject requests
+    // carrying more than a fixed number of tools, and Codex code mode can flatten
+    // a large MCP/app-tool registry into hundreds of functions. Applied here so
+    // the cached registry (restored on continuations) matches what was sent.
+    if provider.max_tools > 0
+        && let Some(tools) = chat_req.tools.as_mut()
+    {
+        let dropped = crate::convert::enforce_tool_budget(tools, provider.max_tools);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                max_tools = provider.max_tools,
+                dropped = dropped.len(),
+                names = ?dropped,
+                "Tool list exceeded max-tools — dropped overflow tools"
+            );
+        }
+    }
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
     // `additional_tools`) can restore it. Empty for models below 5.6 → no-op.
@@ -132,6 +149,7 @@ pub async fn responses(
     let custom_names = crate::convert::resolve_custom_tool_names(
         &state,
         &req.input,
+        req.tools.as_deref(),
         req.previous_response_id.as_deref(),
     )
     .await;

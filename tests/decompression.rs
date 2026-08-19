@@ -65,6 +65,7 @@ async fn spawn_proxy(chat_base_url: String) -> String {
             rewrite: Default::default(),
             max_input_chars: None,
             max_input_messages: 1000,
+            max_tools: 0,
             stream_structured_output: true,
             context_window: None,
             reasoning_levels: vec![responses_proxy::types::ReasoningEffort::Medium],

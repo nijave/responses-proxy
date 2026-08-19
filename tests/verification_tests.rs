@@ -44,6 +44,7 @@ fn test_state_with_rewrite(
             },
             max_input_chars: None,
             max_input_messages: 1000,
+            max_tools: 0,
             stream_structured_output: true,
             context_window: None,
             reasoning_levels: vec![responses_proxy::types::ReasoningEffort::Medium],
@@ -473,7 +474,7 @@ async fn code_mode_tools_restored_on_continuation_turn() {
     let tools1 = chat1.tools.clone().expect("turn 1 has tools");
     assert_eq!(tools1.len(), 2);
     // Cache exactly as the handler does: tools + the custom-name set.
-    let custom_names1 = responses_proxy::convert::custom_tool_names(&turn1_input);
+    let custom_names1 = responses_proxy::convert::custom_tool_names(&turn1_input, None, false);
     assert!(custom_names1.contains("exec"));
     state
         .store()
@@ -522,7 +523,8 @@ async fn resolve_custom_tool_names_falls_back_to_cached() {
         ]}
     ]))
     .unwrap();
-    let names = responses_proxy::convert::resolve_custom_tool_names(&state, &fresh, None).await;
+    let names =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &fresh, None, None).await;
     assert!(names.contains("exec"));
     state
         .store()
@@ -535,12 +537,14 @@ async fn resolve_custom_tool_names_falls_back_to_cached() {
     ]))
     .unwrap();
     let restored =
-        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, Some("resp_a")).await;
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, None, Some("resp_a"))
+            .await;
     assert!(restored.contains("exec"));
 
     // Unknown previous id → no invention.
     let none =
-        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, Some("resp_x")).await;
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, None, Some("resp_x"))
+            .await;
     assert!(none.is_empty());
 }
 
@@ -575,11 +579,89 @@ async fn custom_tool_names_extracted_from_additional_tools() {
         ]}
     ]))
     .unwrap();
-    let names = responses_proxy::convert::custom_tool_names(&input);
+    let names = responses_proxy::convert::custom_tool_names(&input, None, false);
     assert!(names.contains("exec"));
     assert!(names.contains("collab"));
     // namespace *function* members stay function → not in the custom set.
     assert!(!names.contains("mcp__gh__list"));
+}
+
+// ── Codex code-mode: top-level tools convert generically ─────────────
+#[tokio::test]
+async fn top_level_code_mode_tools_converted_and_dropped() {
+    // Codex can deliver its code-mode tools as top-level `tools` (not only via
+    // `additional_tools`): a plain function, a freeform `custom` apply_patch, a
+    // `namespace` of MCP functions, and hosted tools with no Chat equivalent.
+    // With `allowed-tool-types: [function]` (the default), every convertible tool
+    // must collapse to a `function` and hosted ones must be dropped.
+    let state = test_state();
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "tools": [
+            {"type": "function", "name": "exec_command",
+             "parameters": {"type": "object", "properties": {}}},
+            {"type": "custom", "name": "apply_patch",
+             "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+            {"type": "namespace", "name": "mcp", "tools": [
+                {"type": "function", "name": "mcp__gh__list", "parameters": {"type": "object"}}
+            ]},
+            {"type": "web_search"}
+        ],
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    }))
+    .unwrap();
+    let req_tools = req.tools.clone();
+    let chat = responses_to_chat(req, &state).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("tools present")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    // apply_patch (freeform custom) and the MCP namespace function survive as
+    // functions; web_search (hosted) is dropped.
+    assert_eq!(names, vec!["exec_command", "apply_patch", "mcp__gh__list"]);
+
+    // The freeform apply_patch must round-trip: its name is recorded so the
+    // model's function_call is re-emitted as a custom_tool_call.
+    let custom = responses_proxy::convert::custom_tool_names(&[], req_tools.as_deref(), false);
+    assert!(custom.contains("apply_patch"));
+    assert!(!custom.contains("exec_command"));
+    assert!(!custom.contains("mcp__gh__list"));
+}
+
+#[test]
+fn enforce_tool_budget_caps_and_reports_overflow() {
+    let mut tools: Vec<chat::ToolRequest> = (0..10)
+        .map(|i| chat::ToolRequest::Function {
+            function: chat::FunctionTool {
+                name: format!("tool_{i}"),
+                description: None,
+                parameters: None,
+                strict: None,
+            },
+        })
+        .collect();
+
+    // 0 disables the cap.
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 0).is_empty());
+    assert_eq!(tools.len(), 10);
+
+    // Cap keeps the leading tools and reports the dropped tail.
+    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 4);
+    assert_eq!(tools.len(), 4);
+    assert_eq!(
+        dropped,
+        vec!["tool_4", "tool_5", "tool_6", "tool_7", "tool_8", "tool_9"]
+    );
+
+    // Already fits → no-op.
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 4).is_empty());
+    assert_eq!(tools.len(), 4);
 }
 
 #[tokio::test]

@@ -115,6 +115,7 @@ pub(super) async fn handle(
     let custom_names = crate::convert::resolve_custom_tool_names(
         state,
         &req.input,
+        req.tools.as_deref(),
         req.previous_response_id.as_deref(),
     )
     .await;
@@ -173,6 +174,22 @@ pub(super) async fn handle(
         "Forwarding request"
     );
     let mut full_input_messages = chat_req.messages.clone();
+    // Cap the tool list before caching/forwarding (see the HTTP handler): some
+    // gateways reject requests carrying too many tools, and Codex code mode can
+    // flatten a large MCP/app-tool registry into hundreds of functions.
+    if provider.max_tools > 0
+        && let Some(tools) = chat_req.tools.as_mut()
+    {
+        let dropped = crate::convert::enforce_tool_budget(tools, provider.max_tools);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                max_tools = provider.max_tools,
+                dropped = dropped.len(),
+                names = ?dropped,
+                "Tool list exceeded max-tools — dropped overflow tools"
+            );
+        }
+    }
     // Cache the code-mode tool registry so tool-result continuations (which
     // reference this response via `previous_response_id` but omit
     // `additional_tools`) can restore it instead of reaching the model with no

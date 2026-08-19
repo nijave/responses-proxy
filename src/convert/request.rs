@@ -134,8 +134,13 @@ pub async fn responses_to_chat(
     // Names Codex declared as custom (code-mode) — used to keep replayed history
     // calls consistent with the `{ input }` function schema we present. Restored
     // from the previous response on a continuation turn (see the helper).
-    let custom_names =
-        resolve_custom_tool_names(state, &req.input, req.previous_response_id.as_deref()).await;
+    let custom_names = resolve_custom_tool_names(
+        state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
 
     // Walk input items
     let items: Vec<InputItem> = req.input;
@@ -378,49 +383,17 @@ pub async fn responses_to_chat(
         .as_ref()
         .map(|tools| {
             let allow = &state.config().allowed_tool_types;
+            let allow_fn = allow.iter().any(|a| a == "function");
+            let keep_raw_custom = allow.iter().any(|a| a == "custom");
             tools
                 .iter()
-                .filter_map(|t| match t {
-                    crate::types::tool::ToolRequest::Function(f) => {
-                        if allow.contains(&"function".to_string()) {
-                            Some(chat::ToolRequest::Function {
-                                function: chat::FunctionTool {
-                                    name: f.name.clone().unwrap_or_default(),
-                                    description: f.description.clone(),
-                                    parameters: f.parameters.clone(),
-                                    strict: f.strict,
-                                },
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    crate::types::tool::ToolRequest::Custom(c) => {
-                        if allow.contains(&"custom".to_string()) {
-                            Some(chat::ToolRequest::Custom {
-                                custom: chat::CustomTool {
-                                    name: c.name.clone().unwrap_or_default(),
-                                    description: c.description.clone(),
-                                    format: c.format.as_ref().map(|f| match f {
-                                        crate::types::tool::CustomToolFormat::Text(_) => {
-                                            chat::CustomToolFormat::Text
-                                        }
-                                        crate::types::tool::CustomToolFormat::Grammar(g) => {
-                                            chat::CustomToolFormat::Grammar {
-                                                grammar: chat::Grammar {
-                                                    definition: g.definition.clone(),
-                                                    syntax: g.syntax.clone(),
-                                                },
-                                            }
-                                        }
-                                    }),
-                                },
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
+                .flat_map(|t| tool_request_to_chat_tools(t, keep_raw_custom))
+                // The allowlist gates which Chat tool types the upstream accepts.
+                // Everything convertible becomes a `function`; raw `custom` is
+                // only produced when the upstream opted into it above.
+                .filter(|ct| match ct {
+                    chat::ToolRequest::Function { .. } => allow_fn,
+                    _ => true,
                 })
                 .collect::<Vec<_>>()
         })
@@ -491,9 +464,22 @@ pub async fn responses_to_chat(
 /// shape Codex expects on the response side, and their replayed history calls
 /// wrapped to match the `{ input }` function schema we present. Mirrors the
 /// naming used by [`additional_tools_to_chat_functions`].
-pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<String> {
-    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
+pub fn custom_tool_names(
+    input: &[InputItem],
+    tools: Option<&[crate::types::tool::ToolRequest]>,
+    keep_raw_custom: bool,
+) -> std::collections::HashSet<String> {
+    use crate::types::tool::ToolRequest as Rt;
     let mut names = std::collections::HashSet::new();
+    // Top-level tools we present to the model as `{ input }` functions (freeform
+    // custom, apply_patch, custom namespace members) must round-trip back to
+    // `custom_tool_call`. A raw `custom` tool the upstream accepts unchanged
+    // (`keep_raw_custom`) already emits `custom_tool_call` natively, so exclude it.
+    for t in tools.unwrap_or_default() {
+        names.extend(custom_function_names(t, !keep_raw_custom));
+    }
+    // Code-mode `additional_tools` input items carry the same shapes as raw JSON
+    // and always collapse custom to functions, so include their custom names.
     for item in input {
         let InputItem::AdditionalTools(at) = item else {
             continue;
@@ -502,28 +488,46 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
             let Ok(parsed) = serde_json::from_value::<Rt>(v.clone()) else {
                 continue;
             };
-            match parsed {
-                Rt::Custom(c) => {
-                    if let Some(n) = c.name.filter(|n| !is_multi_agent_hosted_action(n)) {
-                        names.insert(n);
-                    }
-                }
-                Rt::Namespace(ns) => {
-                    let is_collab = ns.name.as_deref() == Some("collaboration");
-                    for m in ns.tools.unwrap_or_default() {
-                        let NamespaceToolItem::Custom(nc) = m else {
-                            continue;
-                        };
-                        if !is_collab && !is_multi_agent_hosted_action(&nc.name) {
-                            names.insert(nc.name);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            names.extend(custom_function_names(&parsed, true));
         }
     }
     names
+}
+
+/// Names of tools that [`tool_request_to_chat_tools`] presents to the model as
+/// `{ input }` functions and which therefore need their `function_call`
+/// re-emitted as `custom_tool_call`: freeform `custom` tools (when
+/// `include_custom`), `apply_patch`, and custom `namespace` members. Hosted
+/// multi-agent actions and the `collaboration` namespace are excluded — they are
+/// dropped during conversion, never presented to the model.
+fn custom_function_names(t: &crate::types::tool::ToolRequest, include_custom: bool) -> Vec<String> {
+    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
+    match t {
+        Rt::Custom(c) if include_custom => c
+            .name
+            .clone()
+            .filter(|n| !is_multi_agent_hosted_action(n))
+            .into_iter()
+            .collect(),
+        Rt::ApplyPatch(_) => vec!["apply_patch".to_string()],
+        Rt::Namespace(ns) => {
+            if ns.name.as_deref() == Some("collaboration") {
+                return Vec::new();
+            }
+            ns.tools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| match m {
+                    NamespaceToolItem::Custom(nc) if !is_multi_agent_hosted_action(&nc.name) => {
+                        Some(nc.name.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// [`custom_tool_names`] for the current turn, falling back to the set cached
@@ -535,9 +539,15 @@ pub fn custom_tool_names(input: &[InputItem]) -> std::collections::HashSet<Strin
 pub async fn resolve_custom_tool_names(
     state: &crate::app::State,
     input: &[InputItem],
+    tools: Option<&[crate::types::tool::ToolRequest]>,
     previous_response_id: Option<&str>,
 ) -> std::collections::HashSet<String> {
-    let names = custom_tool_names(input);
+    let keep_raw_custom = state
+        .config()
+        .allowed_tool_types
+        .iter()
+        .any(|a| a == "custom");
+    let names = custom_tool_names(input, tools, keep_raw_custom);
     if names.is_empty()
         && let Some(prev_id) = previous_response_id
         && let Some(cached) = state.store().get_custom_names(prev_id).await
@@ -565,46 +575,108 @@ fn is_multi_agent_hosted_action(name: &str) -> bool {
     )
 }
 
-/// Flatten one Codex `additional_tools` entry (code-mode
-/// `custom`/`namespace`/`function`) into Chat Completions `function` tools.
-/// Unrecognized entries are skipped. Tool names are preserved verbatim so the
-/// `function_call` the model emits routes back to the matching Codex tool.
+/// Flatten one Codex `additional_tools` entry (code-mode JSON) into Chat
+/// Completions tools by parsing it and delegating to [`tool_request_to_chat_tools`].
+/// Unrecognized entries are skipped. Chat Completions rejects raw freeform
+/// `custom` tools, so `additional_tools` always collapse custom to functions.
 fn additional_tools_to_chat_functions(v: &serde_json::Value) -> Vec<chat::ToolRequest> {
-    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
-    let parsed: Rt = match serde_json::from_value(v.clone()) {
+    let parsed: crate::types::tool::ToolRequest = match serde_json::from_value(v.clone()) {
         Ok(t) => t,
         Err(e) => {
             tracing::debug!(error = %e, "additional_tools: unrecognized tool entry, skipping");
             return Vec::new();
         }
     };
-    match parsed {
+    tool_request_to_chat_tools(&parsed, false)
+}
+
+/// Single source of truth for translating one Codex tool definition into the
+/// Chat Completions tools it maps to — used for both top-level `tools` and
+/// code-mode `additional_tools`. Convertible shapes become `function` tools:
+/// freeform `custom` tools and `apply_patch` collapse to a single `input`
+/// string, and `namespace` members are flattened (names preserved so the model's
+/// call routes back to the matching Codex tool). Genuinely hosted /
+/// Responses-only tools (web/file search, computer, code interpreter, image
+/// generation, remote MCP server refs, `tool_search`, local/remote shells,
+/// hosted multi-agent actions) have no Chat Completions equivalent and are
+/// dropped. When `keep_raw_custom` is set (the upstream accepts `custom` via
+/// `allowed-tool-types`), a freeform `custom` tool is forwarded unchanged.
+fn tool_request_to_chat_tools(
+    t: &crate::types::tool::ToolRequest,
+    keep_raw_custom: bool,
+) -> Vec<chat::ToolRequest> {
+    use crate::types::tool::{NamespaceToolItem, ToolRequest as Rt};
+    match t {
         Rt::Function(f) => {
-            let name = f.name.unwrap_or_default();
+            let name = f.name.clone().unwrap_or_default();
             if is_multi_agent_hosted_action(&name) {
                 tracing::warn!(
                     skipped = %name,
-                    "additional_tools: dropping hosted multi-agent tool — not executable via Chat Completions"
+                    "dropping hosted multi-agent tool — not executable via Chat Completions"
                 );
                 return Vec::new();
             }
-            vec![function_tool(name, f.description, f.parameters, f.strict)]
+            vec![function_tool(
+                name,
+                f.description.clone(),
+                f.parameters.clone(),
+                f.strict,
+            )]
         }
+        Rt::Custom(c) => {
+            let name = c.name.clone().unwrap_or_default();
+            if is_multi_agent_hosted_action(&name) {
+                tracing::warn!(
+                    skipped = %name,
+                    "dropping hosted multi-agent tool — not executable via Chat Completions"
+                );
+                return Vec::new();
+            }
+            if keep_raw_custom {
+                vec![chat::ToolRequest::Custom {
+                    custom: chat::CustomTool {
+                        name,
+                        description: c.description.clone(),
+                        format: c.format.as_ref().map(|f| match f {
+                            crate::types::tool::CustomToolFormat::Text(_) => {
+                                chat::CustomToolFormat::Text
+                            }
+                            crate::types::tool::CustomToolFormat::Grammar(g) => {
+                                chat::CustomToolFormat::Grammar {
+                                    grammar: chat::Grammar {
+                                        definition: g.definition.clone(),
+                                        syntax: g.syntax.clone(),
+                                    },
+                                }
+                            }
+                        }),
+                    },
+                }]
+            } else {
+                vec![custom_as_function(name, c.description.clone())]
+            }
+        }
+        // Codex's freeform apply_patch (`apply_patch_tool_type = "freeform"`).
+        // Chat Completions has no freeform tool type, so present it as a function
+        // taking one raw `input` patch string; its calls round-trip back to
+        // `custom_tool_call` via the custom-name set.
+        Rt::ApplyPatch(_) => vec![custom_as_function("apply_patch".to_string(), None)],
         Rt::Namespace(ns) => {
             // The `collaboration` namespace carries the hosted multi-agent
-            // actions (spawn_agent, …). They run inside OpenAI's hosted
-            // Responses runtime, not the client, so a Chat Completions upstream
-            // cannot fulfil them. Drop the whole namespace so the model never
-            // emits a `spawn_agent` call the client rejects as `unsupported
-            // call` — it falls back to the client-executable tools instead.
+            // actions (spawn_agent, …). They run inside the hosted Responses
+            // runtime, not the client, so a Chat Completions upstream cannot
+            // fulfil them. Drop the whole namespace so the model never emits a
+            // `spawn_agent` call the client rejects as `unsupported call` — it
+            // falls back to the client-executable tools instead.
             let is_collab = ns.name.as_deref() == Some("collaboration");
             let mut skipped: Vec<String> = Vec::new();
             let out: Vec<_> = ns
                 .tools
+                .as_deref()
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|item| {
-                    let name = match &item {
+                    let name = match item {
                         NamespaceToolItem::Function(nf) => nf.name.as_str(),
                         NamespaceToolItem::Custom(nc) => nc.name.as_str(),
                     };
@@ -613,11 +685,14 @@ fn additional_tools_to_chat_functions(v: &serde_json::Value) -> Vec<chat::ToolRe
                         return None;
                     }
                     Some(match item {
-                        NamespaceToolItem::Function(nf) => {
-                            function_tool(nf.name, nf.description, nf.parameters, nf.strict)
-                        }
+                        NamespaceToolItem::Function(nf) => function_tool(
+                            nf.name.clone(),
+                            nf.description.clone(),
+                            nf.parameters.clone(),
+                            nf.strict,
+                        ),
                         NamespaceToolItem::Custom(nc) => {
-                            custom_as_function(nc.name, nc.description)
+                            custom_as_function(nc.name.clone(), nc.description.clone())
                         }
                     })
                 })
@@ -625,33 +700,45 @@ fn additional_tools_to_chat_functions(v: &serde_json::Value) -> Vec<chat::ToolRe
             if !skipped.is_empty() {
                 tracing::warn!(
                     skipped = ?skipped,
-                    "additional_tools: dropping hosted multi-agent tools — not executable via Chat Completions"
+                    "dropping hosted multi-agent tools — not executable via Chat Completions"
                 );
             }
             out
         }
-        Rt::Custom(c) => {
-            let name = c.name.unwrap_or_default();
-            if is_multi_agent_hosted_action(&name) {
-                tracing::warn!(
-                    skipped = %name,
-                    "additional_tools: dropping hosted multi-agent tool — not executable via Chat Completions"
-                );
-                return Vec::new();
-            }
-            vec![custom_as_function(name, c.description)]
-        }
         // e.g. `mcp` (remote server reference — no per-tool schema to flatten),
-        // `tool_search`, `web_search`. Codex 5.6 delivers usable MCP tools as a
-        // `namespace` (handled above); anything landing here has no Chat
-        // Completions function equivalent.
-        _ => {
+        // `tool_search`, `web_search`, `file_search`, `computer`,
+        // `code_interpreter`, `image_generation`, `local_shell`, `shell`. Codex
+        // delivers usable MCP tools as a `namespace` (handled above); anything
+        // here has no Chat Completions function equivalent.
+        other => {
             tracing::debug!(
-                tool_type = %v.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
-                "additional_tools: tool type has no Chat function equivalent — skipping"
+                tool_type = %tool_request_type_label(other),
+                "tool type has no Chat function equivalent — skipping"
             );
             Vec::new()
         }
+    }
+}
+
+/// Short, stable type label for a Codex tool request, used in drop logs.
+fn tool_request_type_label(t: &crate::types::tool::ToolRequest) -> &'static str {
+    use crate::types::tool::ToolRequest as Rt;
+    match t {
+        Rt::Function(_) => "function",
+        Rt::FileSearch(_) => "file_search",
+        Rt::WebSearch(_) => "web_search",
+        Rt::WebSearchPreview(_) => "web_search_preview",
+        Rt::Computer(_) => "computer",
+        Rt::ComputerUsePreview(_) => "computer_use_preview",
+        Rt::CodeInterpreter(_) => "code_interpreter",
+        Rt::ImageGeneration(_) => "image_generation",
+        Rt::Mcp(_) => "mcp",
+        Rt::LocalShell(_) => "local_shell",
+        Rt::Shell(_) => "shell",
+        Rt::Custom(_) => "custom",
+        Rt::Namespace(_) => "namespace",
+        Rt::ToolSearch(_) => "tool_search",
+        Rt::ApplyPatch(_) => "apply_patch",
     }
 }
 
@@ -908,6 +995,22 @@ pub fn enforce_message_budget(
     let removed = start - prefix_len;
     messages.drain(prefix_len..start);
     removed
+}
+
+/// Cap the number of tools forwarded to the upstream. Some gateways reject a
+/// request carrying more than a fixed number of tools (e.g. Codex code mode can
+/// flatten a large MCP/app-tool registry into hundreds of functions). When the
+/// converted list exceeds `max`, keep the leading tools — Codex orders its core
+/// coding tools (apply_patch, exec_command, update_plan, …) first — and drop the
+/// overflow, returning the dropped names for logging. No-op when `max` is 0 or
+/// the list already fits.
+pub fn enforce_tool_budget(tools: &mut Vec<chat::ToolRequest>, max: usize) -> Vec<String> {
+    if max == 0 || tools.len() <= max {
+        return Vec::new();
+    }
+    let dropped: Vec<String> = tools[max..].iter().map(chat_tool_name).collect();
+    tools.truncate(max);
+    dropped
 }
 
 /// A short, log-safe label for an input item that the converter does not map to
