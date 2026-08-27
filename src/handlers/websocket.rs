@@ -18,9 +18,13 @@ use axum::response::IntoResponse;
 /// WebSocket upgrade handler for the bidirectional Responses API.
 pub async fn websocket(
     State(state): State<crate::app::State>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |s| run(s, state))
+    // Optional per-instance store namespace, taken from the upgrade request and
+    // applied to every turn on this connection.
+    let ns = super::namespace_from_headers(&headers);
+    ws.on_upgrade(move |s| run(s, state, ns))
 }
 
 /// Send a text frame with debug logging.
@@ -32,7 +36,7 @@ pub(super) async fn send(socket: &mut WebSocket, text: &str) {
 // ── Main event loop ────────────────────────────────────────────────────────
 
 /// Receive loop — dispatches incoming events to their handlers.
-async fn run(mut socket: WebSocket, state: crate::app::State) {
+async fn run(mut socket: WebSocket, state: crate::app::State, ns: String) {
     tracing::info!("WebSocket connection established");
 
     while let Some(Ok(msg)) = socket.recv().await {
@@ -58,7 +62,7 @@ async fn run(mut socket: WebSocket, state: crate::app::State) {
         match event {
             ClientEvent::ResponseCreate(req) => {
                 tracing::info!("WS received event: response.create");
-                create::handle(&state, &mut socket, req).await;
+                create::handle(&state, &mut socket, req, &ns).await;
             }
 
             ClientEvent::ResponseCancel => {

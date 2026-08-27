@@ -19,6 +19,7 @@ fn test_state() -> responses_proxy::app::State {
         models: std::collections::HashMap::new(),
         model_names: vec![],
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     };
     responses_proxy::app::State::new(config)
 }
@@ -41,6 +42,13 @@ fn test_state_with_rewrite(
                 chat_out: rewrite,
                 ..Default::default()
             },
+            max_input_chars: None,
+            max_input_messages: 1000,
+            max_tools: 0,
+            stream_structured_output: true,
+            context_window: None,
+            reasoning_levels: vec![responses_proxy::types::ReasoningEffort::Medium],
+            default_reasoning_level: responses_proxy::types::ReasoningEffort::Medium,
         },
     );
 
@@ -54,6 +62,7 @@ fn test_state_with_rewrite(
         models,
         model_names: vec!["gpt-5.5".into()],
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     };
     responses_proxy::app::State::new(config)
 }
@@ -208,6 +217,9 @@ async fn s3_reasoning_effort_all_levels() {
         ("medium", true, Some("medium")),
         ("high", true, Some("high")),
         ("xhigh", true, Some("xhigh")),
+        // gpt-5.6-class tiers above xhigh — passed through verbatim.
+        ("max", true, Some("max")),
+        ("ultra", true, Some("ultra")),
     ];
 
     for (effort, expect_think, expect_re) in cases {
@@ -230,6 +242,556 @@ async fn s3_reasoning_effort_all_levels() {
             );
         }
     }
+}
+
+// ── Codex gpt-5.6 additional_tools (code-mode) → Chat function tools ─
+#[tokio::test]
+async fn additional_tools_flattened_to_chat_functions() {
+    // gpt-5.6 delivers its tools inside an `additional_tools` input item using
+    // the code-mode custom/namespace protocol. Chat Completions can't take
+    // those, so every entry must be flattened into a plain `function` tool.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JS"},
+                    {"type": "namespace", "name": "shell", "tools": [
+                        {"type": "function", "name": "exec_command", "description": "run",
+                         "parameters": {"type": "object",
+                                        "properties": {"cmd": {"type": "string"}},
+                                        "required": ["cmd"]}},
+                        {"type": "custom", "name": "apply_patch", "description": "patch"}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let tools = j["tools"].as_array().expect("tools present");
+
+    // namespace expands in place; names preserved verbatim for Codex routing.
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["exec", "exec_command", "apply_patch"]);
+
+    // Every hoisted tool is function-typed (nothing left as custom/namespace).
+    for t in tools {
+        assert_eq!(t["type"], "function");
+    }
+    // A real function keeps its own schema.
+    assert_eq!(
+        j["tools"][1]["function"]["parameters"]["properties"]["cmd"]["type"],
+        "string"
+    );
+    // Freeform custom tools collapse to a single string `input` argument.
+    assert_eq!(
+        j["tools"][0]["function"]["parameters"]["properties"]["input"]["type"],
+        "string"
+    );
+    assert_eq!(
+        j["tools"][2]["function"]["parameters"]["properties"]["input"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
+async fn mcp_namespace_tools_flattened_to_chat_functions() {
+    // gpt-5.6 wraps MCP server tools in a proprietary `namespace` entry (member
+    // names like `mcp__server__tool`). Chat Completions can't unwrap that, so
+    // the members must be flattened to plain function tools with names intact.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "namespace", "name": "mcp", "tools": [
+                        {"type": "function", "name": "mcp__github__list_issues",
+                         "description": "List issues",
+                         "parameters": {"type": "object",
+                                        "properties": {"repo": {"type": "string"}},
+                                        "required": ["repo"]}}
+                    ]},
+                    // A remote MCP server reference carries no per-tool schema
+                    // and must be dropped, not crash the request.
+                    {"type": "mcp", "server_label": "github",
+                     "server_url": "https://example.invalid/mcp"}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let tools = j["tools"].as_array().expect("tools present");
+
+    assert_eq!(
+        tools.len(),
+        1,
+        "namespace member kept, mcp server ref dropped"
+    );
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], "mcp__github__list_issues");
+    assert_eq!(
+        tools[0]["function"]["parameters"]["properties"]["repo"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_collaboration_tools_dropped() {
+    // gpt-5.6 multi-agent mode delivers the hosted collaboration actions
+    // (spawn_agent, …) inside a `collaboration` namespace. They execute in
+    // OpenAI's hosted Responses runtime, not the client, so a Chat Completions
+    // upstream cannot fulfil them — advertising them lures the model into
+    // `spawn_agent` calls the client rejects as `unsupported call`. They must be
+    // dropped while the client-executable tools (exec/wait/request_user_input)
+    // are kept, so the model falls back to plain single-agent code-mode.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JS"},
+                    {"type": "function", "name": "wait", "description": "wait",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "function", "name": "request_user_input",
+                     "description": "ask",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "namespace", "name": "collaboration",
+                     "description": "Tools for spawning and managing sub-agents.",
+                     "tools": [
+                        {"type": "function", "name": "spawn_agent",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "followup_task",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "interrupt_agent",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "list_agents",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "send_message",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "wait_agent",
+                         "parameters": {"type": "object", "properties": {}}}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let tools = j["tools"].as_array().expect("tools present");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["exec", "wait", "request_user_input"]);
+    for hosted in [
+        "spawn_agent",
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "wait_agent",
+    ] {
+        assert!(!names.contains(&hosted), "{hosted} must be dropped");
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_hosted_action_dropped_outside_collaboration_namespace() {
+    // Defensive: even if a hosted action arrives as a bare top-level tool or in
+    // a differently-named namespace, it must still be dropped by name.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "function", "name": "spawn_agent",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "namespace", "name": "misc", "tools": [
+                        {"type": "function", "name": "list_agents",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "function", "name": "keep_me",
+                         "parameters": {"type": "object", "properties": {}}}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("tools present")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["keep_me"]);
+}
+
+#[tokio::test]
+async fn code_mode_tools_restored_on_continuation_turn() {
+    // Codex delivers `additional_tools` only on a new user turn; a tool-result
+    // continuation references `previous_response_id` and omits them. The proxy
+    // caches the derived registry under the response id and restores it on the
+    // continuation so the model isn't left with an empty tool set (which made it
+    // stall after a single call).
+    let state = test_state();
+
+    // Turn 1: additional_tools present → tools built and cached under a rid.
+    let turn1: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "custom", "name": "exec", "description": "Run JS"},
+                {"type": "function", "name": "wait",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]}
+        ]
+    }))
+    .unwrap();
+    let turn1_input = turn1.input.clone();
+    let chat1 = responses_to_chat(turn1, &state).await.unwrap();
+    let tools1 = chat1.tools.clone().expect("turn 1 has tools");
+    assert_eq!(tools1.len(), 2);
+    // Cache exactly as the handler does: tools + the custom-name set.
+    let custom_names1 = responses_proxy::convert::custom_tool_names(&turn1_input, None, false);
+    assert!(custom_names1.contains("exec"));
+    state
+        .store()
+        .put_tools("resp_turn1".to_string(), tools1, custom_names1)
+        .await;
+
+    // Turn 2: continuation — no additional_tools, references the prior response.
+    let turn2: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_turn1",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let chat2 = responses_to_chat(turn2, &state).await.unwrap();
+    let j = serde_json::to_value(&chat2).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("continuation restored tools")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["exec", "wait"]);
+
+    // The custom-name set is restorable too, so the continuation's `exec`
+    // response is re-emitted as a custom_tool_call rather than a function_call
+    // (which Codex would cancel).
+    let restored = state
+        .store()
+        .get_custom_names("resp_turn1")
+        .await
+        .expect("custom names cached");
+    assert!(restored.contains("exec"));
+}
+
+#[tokio::test]
+async fn resolve_custom_tool_names_falls_back_to_cached() {
+    use responses_proxy::types::item::InputItem;
+    let state = test_state();
+
+    // Fresh turn with additional_tools resolves directly and is cached.
+    let fresh: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "custom", "name": "exec"}
+        ]}
+    ]))
+    .unwrap();
+    let names =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &fresh, None, None).await;
+    assert!(names.contains("exec"));
+    state
+        .store()
+        .put_tools("resp_a".to_string(), vec![], names)
+        .await;
+
+    // Continuation (no additional_tools) falls back to the cached set.
+    let cont: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+    ]))
+    .unwrap();
+    let restored =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, None, Some("resp_a"))
+            .await;
+    assert!(restored.contains("exec"));
+
+    // Unknown previous id → no invention.
+    let none =
+        responses_proxy::convert::resolve_custom_tool_names(&state, &cont, None, Some("resp_x"))
+            .await;
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn continuation_without_cached_tools_stays_toolless() {
+    // No regression: a continuation that never had code-mode tools (e.g. models
+    // below 5.6) resolves to no tools rather than inventing any.
+    let state = test_state();
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_unknown",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let chat = responses_to_chat(req, &state).await.unwrap();
+    assert!(chat.tools.is_none());
+}
+
+// ── Codex gpt-5.6 code-mode: custom ↔ function round-trip ────────────
+#[tokio::test]
+async fn custom_tool_names_extracted_from_additional_tools() {
+    use responses_proxy::types::item::InputItem;
+    let input: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "custom", "name": "exec"},
+            {"type": "namespace", "name": "mcp", "tools": [
+                {"type": "function", "name": "mcp__gh__list", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "collab"}
+            ]}
+        ]}
+    ]))
+    .unwrap();
+    let names = responses_proxy::convert::custom_tool_names(&input, None, false);
+    assert!(names.contains("exec"));
+    assert!(names.contains("collab"));
+    // namespace *function* members stay function → not in the custom set.
+    assert!(!names.contains("mcp__gh__list"));
+}
+
+// ── Codex code-mode: top-level tools convert generically ─────────────
+#[tokio::test]
+async fn top_level_code_mode_tools_converted_and_dropped() {
+    // Codex can deliver its code-mode tools as top-level `tools` (not only via
+    // `additional_tools`): a plain function, a freeform `custom` apply_patch, a
+    // `namespace` of MCP functions, and hosted tools with no Chat equivalent.
+    // With `allowed-tool-types: [function]` (the default), every convertible tool
+    // must collapse to a `function` and hosted ones must be dropped.
+    let state = test_state();
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "tools": [
+            {"type": "function", "name": "exec_command",
+             "parameters": {"type": "object", "properties": {}}},
+            {"type": "custom", "name": "apply_patch",
+             "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+            {"type": "namespace", "name": "mcp", "tools": [
+                {"type": "function", "name": "mcp__gh__list", "parameters": {"type": "object"}}
+            ]},
+            {"type": "web_search"}
+        ],
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    }))
+    .unwrap();
+    let req_tools = req.tools.clone();
+    let chat = responses_to_chat(req, &state).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let names: Vec<&str> = j["tools"]
+        .as_array()
+        .expect("tools present")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    // apply_patch (freeform custom) and the MCP namespace function survive as
+    // functions; web_search (hosted) is dropped.
+    assert_eq!(names, vec!["exec_command", "apply_patch", "mcp__gh__list"]);
+
+    // The freeform apply_patch must round-trip: its name is recorded so the
+    // model's function_call is re-emitted as a custom_tool_call.
+    let custom = responses_proxy::convert::custom_tool_names(&[], req_tools.as_deref(), false);
+    assert!(custom.contains("apply_patch"));
+    assert!(!custom.contains("exec_command"));
+    assert!(!custom.contains("mcp__gh__list"));
+}
+
+#[test]
+fn enforce_tool_budget_caps_and_reports_overflow() {
+    let mut tools: Vec<chat::ToolRequest> = (0..10)
+        .map(|i| chat::ToolRequest::Function {
+            function: chat::FunctionTool {
+                name: format!("tool_{i}"),
+                description: None,
+                parameters: None,
+                strict: None,
+            },
+        })
+        .collect();
+
+    // 0 disables the cap.
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 0).is_empty());
+    assert_eq!(tools.len(), 10);
+
+    // Cap keeps the leading tools and reports the dropped tail.
+    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 4);
+    assert_eq!(tools.len(), 4);
+    assert_eq!(
+        dropped,
+        vec!["tool_4", "tool_5", "tool_6", "tool_7", "tool_8", "tool_9"]
+    );
+
+    // Already fits → no-op.
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 4).is_empty());
+    assert_eq!(tools.len(), 4);
+}
+
+#[tokio::test]
+async fn nonstreaming_function_call_remapped_to_custom_by_name() {
+    let chat: chat::Completion = serde_json::from_value(json!({
+        "id": "c", "object": "chat.completion", "created": 1u64, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}},
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "update_plan", "arguments": "{\"x\":1}"}}
+            ]
+        }}]
+    }))
+    .unwrap();
+    let mut resp = chat_to_responses(chat, "gpt-5.6-sol".into(), None);
+    let custom: std::collections::HashSet<String> = ["exec".to_string()].into_iter().collect();
+    responses_proxy::convert::remap_custom_tool_calls(&mut resp, &custom);
+
+    let j = serde_json::to_value(&resp).unwrap();
+    let out = j["output"].as_array().unwrap();
+    let exec = out.iter().find(|i| i["name"] == "exec").unwrap();
+    assert_eq!(exec["type"], "custom_tool_call");
+    assert_eq!(exec["input"], "pwd", "the {{input}} wrapper is unwrapped");
+    let plan = out.iter().find(|i| i["name"] == "update_plan").unwrap();
+    assert_eq!(
+        plan["type"], "function_call",
+        "non-custom names stay function"
+    );
+}
+
+#[tokio::test]
+async fn nonstreaming_remap_is_noop_without_custom_names() {
+    // Regression guard for models below 5.6: empty set leaves function calls intact.
+    let chat: chat::Completion = serde_json::from_value(json!({
+        "id": "c", "object": "chat.completion", "created": 1u64, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "exec", "arguments": "{}"}}]
+        }}]
+    }))
+    .unwrap();
+    let mut resp = chat_to_responses(chat, "gpt-5.5".into(), None);
+    responses_proxy::convert::remap_custom_tool_calls(&mut resp, &std::collections::HashSet::new());
+    let j = serde_json::to_value(&resp).unwrap();
+    assert_eq!(j["output"][0]["type"], "function_call");
+}
+
+#[tokio::test]
+async fn streaming_custom_tool_emits_custom_tool_call_events() {
+    let mut state = StreamState::new("resp".into(), "msg".into(), "gpt-5.6-sol".into());
+    state.custom_tool_names.insert("exec".to_string());
+
+    let mut events = process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"exec","arguments":"{\"input\":\"pwd\"}"}}]}}]}"#).unwrap(),
+    )
+    .unwrap_or_default();
+    events.extend(build_completion_events(&mut state));
+
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| {
+            serde_json::to_value(e).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    // Custom tool call, not a function call, on the wire.
+    assert!(
+        types
+            .iter()
+            .any(|t| t == "response.custom_tool_call_input.done")
+    );
+    assert!(
+        !types
+            .iter()
+            .any(|t| t == "response.function_call_arguments.delta"),
+        "function arg deltas must be suppressed for custom tools"
+    );
+
+    let jsons: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+    let added = jsons
+        .iter()
+        .find(|e| e["type"] == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added["item"]["type"], "custom_tool_call");
+    let done = jsons
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done["item"]["type"], "custom_tool_call");
+    assert_eq!(done["item"]["input"], "pwd");
+    // completed_items keeps the function shape for upstream replay.
+    assert!(matches!(
+        state.completed_items.first(),
+        Some(responses_proxy::types::item::OutputItem::FunctionCall(_))
+    ));
+}
+
+#[tokio::test]
+async fn history_custom_tool_call_wrapped_as_input_json() {
+    // A replayed code-mode call must use the `{ input }` function-arg shape.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"type": "additional_tools", "role": "developer",
+             "tools": [{"type": "custom", "name": "exec"}]},
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "exec",
+             "input": "tools.exec_command({cmd:[\"pwd\"]})"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let msgs = j["messages"].as_array().unwrap();
+    let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+    let args = assistant["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
+    assert_eq!(parsed["input"], "tools.exec_command({cmd:[\"pwd\"]})");
 }
 
 #[tokio::test]
@@ -775,6 +1337,36 @@ async fn s13_streaming_output_index_with_reasoning() {
     assert!(!state.accumulated_text.is_empty());
     assert_eq!(state.msg_output_index, 1);
     assert_eq!(state.tool_calls[0].output_index, 2);
+}
+
+// ── Scenario 13b: Preamble text preserved when a tool call follows ───
+// Regression: a text→tool_calls transition moves the assistant message into
+// `completed_items` and clears `accumulated_text`. `to_response_message`
+// (WebSocket persistence) must recover the preamble from `completed_items`,
+// otherwise the stored history drops it and the model re-acknowledges the
+// user's message on every subsequent tool-call turn.
+#[tokio::test]
+async fn s13b_preamble_text_survives_tool_call_transition() {
+    let mut state = StreamState::new("resp_test".into(), "msg_test".into(), "test".into());
+
+    // Chunk 1: assistant preamble text only.
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"On it."}}]}"#).unwrap(),
+    );
+    // Chunk 2: tool call with no content — triggers the text→tool_calls transition.
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#).unwrap(),
+    );
+
+    // The transition cleared accumulated_text and stored the message.
+    assert!(state.accumulated_text.is_empty());
+
+    // Persisted message must still carry the preamble AND the tool call.
+    let msg = state.to_response_message();
+    assert_eq!(msg.content.as_deref(), Some("On it."));
+    assert!(msg.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()));
 }
 
 // ── Scenario 14: Streaming in_progress after created ─────────────────

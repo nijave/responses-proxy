@@ -2119,7 +2119,7 @@ Returns `CompactedResponse`:
 
 ```ts
 CompactedResponse {
-  id: string;                        // "rcmp_xxx"
+  id: string;                        // "cmp_xxx"
   object: "response.compaction";     // *
   created_at: number;                // *
   output: OutputItem[];              // * Compacted items
