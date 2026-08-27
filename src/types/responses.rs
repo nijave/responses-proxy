@@ -524,11 +524,13 @@ pub enum TextFormat {
 #[serde(rename_all = "snake_case")]
 pub struct Reasoning {
     /// Reasoning effort.
-    /// Allowed: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`.
+    /// Allowed: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+    /// `"max"`, `"ultra"`.
     ///
     /// Default: gpt-5.1 defaults to `"none"`; earlier models default to
     /// `"medium"`.  `gpt-5-pro` forces `"high"`.  `"xhigh"` is only available
-    /// on `gpt-5.1-codex-max` and later.
+    /// on `gpt-5.1-codex-max` and later; `"max"`/`"ultra"` are gpt-5.6-class
+    /// tiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<super::ReasoningEffort>,
 
@@ -666,7 +668,7 @@ pub struct StreamOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CompactedResponse {
-    /// Compaction ID, e.g. `"rcmp_xxx"`.
+    /// Compaction ID, e.g. `"cmp_xxx"`.
     pub id: String,
     /// Object type — always `"response.compaction"`.
     #[serde(default = "default_compaction_object")]
